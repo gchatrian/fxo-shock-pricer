@@ -2,12 +2,13 @@
 Bloomberg market data fetcher for FX options.
 Retrieves spot rates, forward points, volatility surface, and interest rates.
 Supports non-USD crosses with implied rate calculation.
+Supports historical data fetch for shock analysis.
 """
 
 import logging
 import math
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, timedelta
 from typing import Dict, List, Optional, Any
 
 from .connection import BloombergConnection, BloombergConnectionError
@@ -526,3 +527,403 @@ class MarketDataFetcher:
                 logger.warning(f"Incomplete vol data for {ccy_pair} {tenor}")
 
         return market_data
+
+
+class HistoricalDataFetcher:
+    """
+    Fetches historical FX market data from Bloomberg.
+    Uses HistoricalDataRequest to get data for specific dates.
+    """
+
+    def __init__(self, connection: BloombergConnection):
+        """Initialize fetcher with Bloomberg connection."""
+        self._connection = connection
+
+    def _check_connection(self) -> None:
+        """Verify Bloomberg connection is available."""
+        if not self._connection.is_connected():
+            raise BloombergConnectionError("Bloomberg is not connected")
+
+    def _request_historical_data(
+        self,
+        tickers: List[str],
+        start_date: date,
+        end_date: date,
+        fields: List[str] = None
+    ) -> Dict[str, Dict[str, float]]:
+        """
+        Request historical data from Bloomberg.
+
+        Args:
+            tickers: List of Bloomberg tickers
+            start_date: Start date
+            end_date: End date
+            fields: List of fields (default: ["PX_LAST"])
+
+        Returns:
+            Dictionary mapping ticker -> date -> value
+        """
+        self._check_connection()
+
+        if fields is None:
+            fields = ["PX_LAST"]
+
+        if not BLPAPI_AVAILABLE:
+            raise BloombergConnectionError("blpapi is not available")
+
+        service = self._connection.get_ref_data_service()
+        if service is None:
+            raise BloombergConnectionError("Reference data service not available")
+
+        request = service.createRequest("HistoricalDataRequest")
+
+        for ticker in tickers:
+            request.append("securities", ticker)
+
+        for field in fields:
+            request.append("fields", field)
+
+        request.set("startDate", start_date.strftime("%Y%m%d"))
+        request.set("endDate", end_date.strftime("%Y%m%d"))
+        request.set("periodicitySelection", "DAILY")
+
+        session = self._connection.get_session()
+        session.sendRequest(request)
+
+        results: Dict[str, Dict[str, float]] = {}
+
+        while True:
+            event = session.nextEvent(5000)
+
+            for msg in event:
+                if msg.hasElement("securityData"):
+                    security_data = msg.getElement("securityData")
+                    ticker = security_data.getElementAsString("security")
+
+                    if security_data.hasElement("fieldData"):
+                        field_data_array = security_data.getElement("fieldData")
+
+                        for i in range(field_data_array.numValues()):
+                            field_data = field_data_array.getValueAsElement(i)
+
+                            if field_data.hasElement("date"):
+                                data_date = field_data.getElementAsString("date")
+
+                                if ticker not in results:
+                                    results[ticker] = {}
+
+                                for field in fields:
+                                    if field_data.hasElement(field):
+                                        try:
+                                            value = field_data.getElementAsFloat(field)
+                                            results[ticker][data_date] = value
+                                        except Exception as e:
+                                            logger.warning(f"Could not get {field} for {ticker}: {e}")
+
+            if event.eventType() == blpapi.Event.RESPONSE:
+                break
+
+        return results
+
+    def fetch_historical(
+        self,
+        ccy_pair: str,
+        tenors: List[str],
+        target_date: date
+    ) -> Dict:
+        """
+        Fetch all historical market data for a specific date.
+
+        Args:
+            ccy_pair: Currency pair (e.g., "EURUSD")
+            tenors: List of tenors
+            target_date: Target date for data
+
+        Returns:
+            Dictionary with spot, forward_points, atm_vols, usd_rates
+        """
+        ccy_pair = ccy_pair.upper().replace("/", "")
+
+        # Build all tickers
+        all_tickers = []
+
+        # Spot
+        spot_ticker = TickerBuilder.spot_ticker(ccy_pair, "BGN")
+        all_tickers.append(spot_ticker)
+
+        # Forward points
+        fwd_tickers = {}
+        for tenor in tenors:
+            ticker = TickerBuilder.forward_points_ticker(ccy_pair, tenor, "BGN")
+            fwd_tickers[tenor] = ticker
+            all_tickers.append(ticker)
+
+        # ATM vols
+        vol_tickers = {}
+        for tenor in tenors:
+            ticker = TickerBuilder.vol_atm_ticker(ccy_pair, tenor)
+            vol_tickers[tenor] = ticker
+            all_tickers.append(ticker)
+
+        # USD rates
+        usd_tickers = TickerBuilder.get_usd_curve_tickers(tenors, "BGN")
+        all_tickers.extend(usd_tickers.values())
+
+        # Fetch data
+        date_str = target_date.strftime("%Y-%m-%d")
+        raw_data = self._request_historical_data(all_tickers, target_date, target_date)
+
+        # Parse results
+        result = {
+            'spot': 0.0,
+            'forward_points': {},
+            'atm_vols': {},
+            'usd_rates': {},
+            'date': target_date
+        }
+
+        # Get spot
+        if spot_ticker in raw_data:
+            for dt, val in raw_data[spot_ticker].items():
+                result['spot'] = val
+
+        # Get forward points
+        for tenor, ticker in fwd_tickers.items():
+            if ticker in raw_data:
+                for dt, val in raw_data[ticker].items():
+                    result['forward_points'][tenor] = val
+
+        # Get ATM vols
+        for tenor, ticker in vol_tickers.items():
+            if ticker in raw_data:
+                for dt, val in raw_data[ticker].items():
+                    result['atm_vols'][tenor] = val
+
+        # Get USD rates
+        for tenor, ticker in usd_tickers.items():
+            if ticker in raw_data:
+                for dt, val in raw_data[ticker].items():
+                    result['usd_rates'][tenor] = val
+
+        logger.info(f"Historical data for {ccy_pair} on {target_date}:")
+        logger.info(f"  Spot: {result['spot']}")
+        logger.info(f"  Forward points: {result['forward_points']}")
+        logger.info(f"  ATM vols: {result['atm_vols']}")
+        logger.info(f"  USD rates: {result['usd_rates']}")
+
+        return result
+
+
+@dataclass
+class MarketDataDelta:
+    """
+    Contains the differences between two market data snapshots.
+    Used for historical shock analysis.
+    """
+    start_date: date
+    end_date: date
+    time_diff_days: int
+    
+    # Spot: percentage change (end - start) / start
+    spot_pct_change: float = 0.0
+    
+    # Forward points: percentage change per tenor
+    forward_pct_changes: Dict[str, float] = field(default_factory=dict)
+    
+    # Interest rates: absolute difference (end - start) per tenor
+    usd_rate_diffs: Dict[str, float] = field(default_factory=dict)
+    
+    # ATM volatility: absolute difference (end - start) per tenor
+    atm_vol_diffs: Dict[str, float] = field(default_factory=dict)
+    
+    @classmethod
+    def calculate(
+        cls,
+        start_data: Dict,
+        end_data: Dict,
+        start_date: date,
+        end_date: date
+    ) -> 'MarketDataDelta':
+        """
+        Calculate differences between two market data snapshots.
+        
+        Args:
+            start_data: Historical data dict for start date
+            end_data: Historical data dict for end date
+            start_date: Start date
+            end_date: End date
+            
+        Returns:
+            MarketDataDelta with all calculated differences
+        """
+        logger.info(f"=== CALCULATING MARKET DATA DELTA ===")
+        logger.info(f"Start date: {start_date}, End date: {end_date}")
+        
+        time_diff = (end_date - start_date).days
+        logger.info(f"Time difference: {time_diff} days")
+        
+        # Spot percentage change
+        spot_start = start_data.get('spot', 0)
+        spot_end = end_data.get('spot', 0)
+        if spot_start > 0:
+            spot_pct = (spot_end - spot_start) / spot_start
+        else:
+            spot_pct = 0.0
+        logger.info(f"Spot: {spot_start:.5f} -> {spot_end:.5f} ({spot_pct*100:+.2f}%)")
+        
+        # Forward points percentage change
+        fwd_pct_changes = {}
+        for tenor in start_data.get('forward_points', {}).keys():
+            start_pts = start_data['forward_points'].get(tenor, 0)
+            end_pts = end_data.get('forward_points', {}).get(tenor, 0)
+            if start_pts != 0:
+                pct_change = (end_pts - start_pts) / abs(start_pts)
+            else:
+                pct_change = 0.0
+            fwd_pct_changes[tenor] = pct_change
+            logger.info(f"  Fwd {tenor}: {start_pts:.2f} -> {end_pts:.2f} ({pct_change*100:+.2f}%)")
+        
+        # USD rate differences (absolute)
+        rate_diffs = {}
+        for tenor in start_data.get('usd_rates', {}).keys():
+            start_rate = start_data['usd_rates'].get(tenor, 0)
+            end_rate = end_data.get('usd_rates', {}).get(tenor, 0)
+            diff = end_rate - start_rate
+            rate_diffs[tenor] = diff / 100.0  # Convert from bps to decimal
+            logger.info(f"  USD Rate {tenor}: {start_rate:.3f}% -> {end_rate:.3f}% ({diff:+.3f}%)")
+        
+        # ATM vol differences (absolute)
+        vol_diffs = {}
+        for tenor in start_data.get('atm_vols', {}).keys():
+            start_vol = start_data['atm_vols'].get(tenor, 0)
+            end_vol = end_data.get('atm_vols', {}).get(tenor, 0)
+            diff = end_vol - start_vol
+            vol_diffs[tenor] = diff / 100.0  # Convert from % to decimal
+            logger.info(f"  ATM Vol {tenor}: {start_vol:.2f}% -> {end_vol:.2f}% ({diff:+.2f}%)")
+        
+        logger.info(f"=== DELTA CALCULATION COMPLETE ===")
+        
+        return cls(
+            start_date=start_date,
+            end_date=end_date,
+            time_diff_days=time_diff,
+            spot_pct_change=spot_pct,
+            forward_pct_changes=fwd_pct_changes,
+            usd_rate_diffs=rate_diffs,
+            atm_vol_diffs=vol_diffs
+        )
+
+
+@dataclass
+class ShockedMarketData:
+    """
+    Market data with shock applied.
+    """
+    spot: float
+    forward_rates: Dict[str, float]
+    domestic_rates: Dict[str, float]
+    foreign_rates: Dict[str, float]
+    atm_vols: Dict[str, float]
+    shocked_expiry_days: int
+    original_expiry_days: int
+    
+    # Delta details for display
+    spot_shock_pct: float
+    vol_shock: float  # Average vol shock for display
+    rate_shock: float  # Average rate shock for display
+
+
+class ShockCalculator:
+    """
+    Applies historical shocks to current market data.
+    """
+    
+    @classmethod
+    def apply_shock(
+        cls,
+        current_market_data: 'MarketData',
+        delta: MarketDataDelta,
+        original_expiry_days: int
+    ) -> ShockedMarketData:
+        """
+        Apply shock to current market data.
+        
+        Args:
+            current_market_data: Current MarketData object
+            delta: MarketDataDelta with calculated differences
+            original_expiry_days: Original option expiry in days
+            
+        Returns:
+            ShockedMarketData with all values adjusted
+        """
+        logger.info(f"=== APPLYING SHOCK TO MARKET DATA ===")
+        
+        # 1. Spot shock (percentage change)
+        shocked_spot = current_market_data.spot * (1 + delta.spot_pct_change)
+        logger.info(f"Spot: {current_market_data.spot:.5f} * (1 + {delta.spot_pct_change:.4f}) = {shocked_spot:.5f}")
+        
+        # 2. Forward rates shock (percentage change)
+        shocked_forwards = {}
+        pip_scale = 10000 if "JPY" not in current_market_data.ccy_pair else 100
+        for tenor, fwd in current_market_data.forward_rates.items():
+            pct_change = delta.forward_pct_changes.get(tenor, 0)
+            # Apply percentage change to forward points, then recalculate forward
+            fwd_pts = (fwd - current_market_data.spot) * pip_scale
+            shocked_pts = fwd_pts * (1 + pct_change)
+            shocked_fwd = shocked_spot + shocked_pts / pip_scale
+            shocked_forwards[tenor] = shocked_fwd
+            logger.info(f"  Fwd {tenor}: {fwd:.5f} -> {shocked_fwd:.5f}")
+        
+        # 3. Domestic rates shock (absolute difference)
+        shocked_dom_rates = {}
+        for tenor, rate in current_market_data.domestic_rates.items():
+            diff = delta.usd_rate_diffs.get(tenor, 0)
+            shocked_rate = rate + diff
+            shocked_dom_rates[tenor] = shocked_rate
+            logger.info(f"  Dom Rate {tenor}: {rate:.4f} + {diff:.4f} = {shocked_rate:.4f}")
+        
+        # 4. Foreign rates shock (recalculate from forwards)
+        shocked_for_rates = {}
+        for tenor, rate in current_market_data.foreign_rates.items():
+            # Use the same diff as USD for simplicity, or recalculate from IRP
+            diff = delta.usd_rate_diffs.get(tenor, 0)
+            shocked_rate = rate + diff
+            shocked_for_rates[tenor] = shocked_rate
+            logger.info(f"  For Rate {tenor}: {rate:.4f} + {diff:.4f} = {shocked_rate:.4f}")
+        
+        # 5. ATM vol shock (absolute difference)
+        shocked_vols = {}
+        avg_vol_shock = 0.0
+        vol_count = 0
+        for tenor, smile in current_market_data.vol_smiles.items():
+            diff = delta.atm_vol_diffs.get(tenor, 0)
+            shocked_vol = smile.atm + diff
+            shocked_vols[tenor] = max(0.001, shocked_vol)  # Floor at 0.1%
+            avg_vol_shock += diff
+            vol_count += 1
+            logger.info(f"  Vol {tenor}: {smile.atm:.4f} + {diff:.4f} = {shocked_vol:.4f}")
+        
+        if vol_count > 0:
+            avg_vol_shock /= vol_count
+        
+        # 6. Expiry shock (time decay)
+        shocked_expiry = original_expiry_days - delta.time_diff_days
+        logger.info(f"Expiry: {original_expiry_days} - {delta.time_diff_days} = {shocked_expiry} days")
+        
+        # Average rate shock for display
+        avg_rate_shock = sum(delta.usd_rate_diffs.values()) / len(delta.usd_rate_diffs) if delta.usd_rate_diffs else 0
+        
+        logger.info(f"=== SHOCK APPLICATION COMPLETE ===")
+        
+        return ShockedMarketData(
+            spot=shocked_spot,
+            forward_rates=shocked_forwards,
+            domestic_rates=shocked_dom_rates,
+            foreign_rates=shocked_for_rates,
+            atm_vols=shocked_vols,
+            shocked_expiry_days=shocked_expiry,
+            original_expiry_days=original_expiry_days,
+            spot_shock_pct=delta.spot_pct_change,
+            vol_shock=avg_vol_shock,
+            rate_shock=avg_rate_shock
+        )

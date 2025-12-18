@@ -3,15 +3,16 @@ Main window for FX Option Pricer.
 """
 
 import logging
-from datetime import date, timedelta
+import math
+from datetime import date, timedelta, datetime
 from typing import Optional, Dict
 
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
     QLabel, QLineEdit, QComboBox, QPushButton, QFrame, QMessageBox,
-    QStatusBar, QGroupBox, QSizePolicy
+    QStatusBar, QGroupBox, QSizePolicy, QDateEdit
 )
-from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtCore import Qt, QTimer, QDate
 
 from .styles import get_stylesheet, COLORS
 from .widgets import (
@@ -20,7 +21,10 @@ from .widgets import (
 )
 from ..config.config_parser import Config, load_config
 from ..bloomberg.connection import BloombergConnection, BloombergConnectionError
-from ..bloomberg.data_fetcher import MarketDataFetcher, MarketData
+from ..bloomberg.data_fetcher import (
+    MarketDataFetcher, MarketData, HistoricalDataFetcher,
+    MarketDataDelta, ShockCalculator, ShockedMarketData
+)
 from ..models.garman_kohlhagen import GarmanKohlhagen, OptionParams, Direction
 from ..calendars.fx_conventions import FXCalendarFactory
 from ..volatility.surface import VolSurface, VolSmile
@@ -41,6 +45,14 @@ class FXOptionPricer(QMainWindow):
         self._vol_surface: Optional[VolSurface] = None
         self._fx_rates: Optional[FXRates] = None
         self._bbg_connected: bool = False
+        
+        # Shock analysis data
+        self._shock_start_data: Optional[Dict] = None
+        self._shock_end_data: Optional[Dict] = None
+        self._market_delta: Optional[MarketDataDelta] = None
+        self._shocked_market_data: Optional[ShockedMarketData] = None
+        self._last_pricing_result = None
+        self._last_pricing_params: Optional[OptionParams] = None
 
         # Initialize
         self._load_config()
@@ -48,6 +60,9 @@ class FXOptionPricer(QMainWindow):
         self._apply_style()
         self._connect_signals()
         self._set_defaults()
+
+        # Try to connect to Bloomberg
+        QTimer.singleShot(100, self._try_connect_bloomberg)
 
         # Try to connect to Bloomberg
         QTimer.singleShot(100, self._try_connect_bloomberg)
@@ -64,24 +79,50 @@ class FXOptionPricer(QMainWindow):
             self._config.currency_pairs = ["EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCAD", "USDCHF", "EURGBP", "AUDNZD"]
 
     def _setup_ui(self) -> None:
-        """Set up the user interface."""
+        """Set up the user interface with two columns."""
         self.setWindowTitle("FX Option Pricer")
-        self.setMinimumSize(420, 600)
+        self.setMinimumSize(900, 700)
 
         # Central widget
         central = QWidget()
         self.setCentralWidget(central)
 
-        main_layout = QVBoxLayout(central)
+        # Main horizontal layout for two columns
+        main_layout = QHBoxLayout(central)
         main_layout.setContentsMargins(5, 5, 5, 5)
-        main_layout.setSpacing(2)
+        main_layout.setSpacing(10)
 
-        # Create all sections
-        self._create_header_section(main_layout)
-        self._create_input_section(main_layout)
-        self._create_market_data_section(main_layout)
-        self._create_greeks_section(main_layout)
-        self._create_results_section(main_layout)
+        # LEFT COLUMN - Pricer
+        left_widget = QWidget()
+        left_layout = QVBoxLayout(left_widget)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+        left_layout.setSpacing(2)
+
+        self._create_header_section(left_layout)
+        self._create_input_section(left_layout)
+        self._create_market_data_section(left_layout)
+        self._create_greeks_section(left_layout)
+        self._create_results_section(left_layout)
+
+        main_layout.addWidget(left_widget, stretch=1)
+
+        # Vertical separator
+        separator = QFrame()
+        separator.setFrameShape(QFrame.Shape.VLine)
+        separator.setFrameShadow(QFrame.Shadow.Sunken)
+        main_layout.addWidget(separator)
+
+        # RIGHT COLUMN - Shock Analysis
+        right_widget = QWidget()
+        right_layout = QVBoxLayout(right_widget)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        right_layout.setSpacing(2)
+
+        self._create_shock_params_section(right_layout)
+        self._create_shock_deltas_section(right_layout)
+        self._create_shocked_results_section(right_layout)
+
+        main_layout.addWidget(right_widget, stretch=1)
 
         # Status bar
         self.statusBar().showMessage("Ready")
@@ -128,8 +169,7 @@ class FXOptionPricer(QMainWindow):
 
         # Spot
         grid.addWidget(QLabel("Spot"), row, 0)
-        self.spot_source = QComboBox()
-        self.spot_source.addItems(["Mid", "Bid", "Ask"])
+        self.spot_source = QLabel("Mid")
         self.spot_source.setFixedWidth(50)
         grid.addWidget(self.spot_source, row, 1)
         self.spot_input = NumericInput(decimals=5)
@@ -138,12 +178,10 @@ class FXOptionPricer(QMainWindow):
 
         # Style
         grid.addWidget(QLabel("Style"), row, 0)
-        self.style_combo = QComboBox()
-        self.style_combo.addItems(["European", "American"])
-        self.style_combo.setFixedWidth(80)
-        grid.addWidget(self.style_combo, row, 1)
-        self.style_type = QComboBox()
-        self.style_type.addItems(["Vanilla", "Barrier"])
+        self.style_label = QLabel("European")
+        self.style_label.setFixedWidth(80)
+        grid.addWidget(self.style_label, row, 1)
+        self.style_type = QLabel("Vanilla")
         grid.addWidget(self.style_type, row, 2)
         row += 1
 
@@ -152,9 +190,8 @@ class FXOptionPricer(QMainWindow):
         self.direction_combo = QComboBox()
         self.direction_combo.addItems(["Client buys", "Client sells"])
         grid.addWidget(self.direction_combo, row, 1)
-        self.settlement_combo = QComboBox()
-        self.settlement_combo.addItems(["Physical", "Cash"])
-        grid.addWidget(self.settlement_combo, row, 2)
+        self.settlement_label = QLabel("Physical")
+        grid.addWidget(self.settlement_label, row, 2)
         row += 1
 
         # Call/Put
@@ -210,9 +247,8 @@ class FXOptionPricer(QMainWindow):
 
         # Model
         grid.addWidget(QLabel("Model"), row, 0)
-        self.model_combo = QComboBox()
-        self.model_combo.addItems(["Black-Scholes"])
-        grid.addWidget(self.model_combo, row, 1, 1, 2)
+        self.model_label = QLabel("Black-Scholes")
+        grid.addWidget(self.model_label, row, 1, 1, 2)
 
         parent_layout.addLayout(grid)
 
@@ -228,8 +264,7 @@ class FXOptionPricer(QMainWindow):
 
         # Vol
         grid.addWidget(QLabel("Vol"), row, 0)
-        self.vol_source = QComboBox()
-        self.vol_source.addItems(["BGN", "Mid", "Bid", "Ask"])
+        self.vol_source = QLabel("BGN")
         self.vol_source.setFixedWidth(50)
         grid.addWidget(self.vol_source, row, 1)
         self.vol_display = QLineEdit()
@@ -237,17 +272,9 @@ class FXOptionPricer(QMainWindow):
         grid.addWidget(self.vol_display, row, 2)
         row += 1
 
-        # Vol Spread
-        grid.addWidget(QLabel("Vol Spread"), row, 0)
-        self.vol_spread = NumericInput(decimals=3)
-        self.vol_spread.setText("0.000")
-        grid.addWidget(self.vol_spread, row, 2)
-        row += 1
-
         # Points
         grid.addWidget(QLabel("Points"), row, 0)
-        self.points_source = QComboBox()
-        self.points_source.addItems(["BGN", "Mid"])
+        self.points_source = QLabel("BGN")
         self.points_source.setFixedWidth(50)
         grid.addWidget(self.points_source, row, 1)
         self.points_display = QLineEdit()
@@ -257,8 +284,7 @@ class FXOptionPricer(QMainWindow):
 
         # Forward
         grid.addWidget(QLabel("Forward"), row, 0)
-        self.forward_source = QComboBox()
-        self.forward_source.addItems(["Mid", "Bid", "Ask"])
+        self.forward_source = QLabel("Mid")
         self.forward_source.setFixedWidth(50)
         grid.addWidget(self.forward_source, row, 1)
         self.forward_display = QLineEdit()
@@ -269,8 +295,7 @@ class FXOptionPricer(QMainWindow):
         # Foreign Depo (base currency rate)
         self.foreign_depo_label = QLabel("EUR Depo")
         grid.addWidget(self.foreign_depo_label, row, 0)
-        self.foreign_depo_source = QComboBox()
-        self.foreign_depo_source.addItems(["Implied", "Mid"])
+        self.foreign_depo_source = QLabel("Implied")
         self.foreign_depo_source.setFixedWidth(60)
         grid.addWidget(self.foreign_depo_source, row, 1)
         self.foreign_depo_display = QLineEdit()
@@ -281,8 +306,7 @@ class FXOptionPricer(QMainWindow):
         # Domestic Depo (quote currency rate)
         self.domestic_depo_label = QLabel("USD Depo")
         grid.addWidget(self.domestic_depo_label, row, 0)
-        self.domestic_depo_source = QComboBox()
-        self.domestic_depo_source.addItems(["Implied", "USD SOFR"])
+        self.domestic_depo_source = QLabel("Implied")
         self.domestic_depo_source.setFixedWidth(70)
         grid.addWidget(self.domestic_depo_source, row, 1)
         self.domestic_depo_display = QLineEdit()
@@ -301,10 +325,9 @@ class FXOptionPricer(QMainWindow):
 
         # Gamma
         grid.addWidget(QLabel("Gamma"), 0, 0)
-        self.gamma_ccy = QComboBox()
-        self.gamma_ccy.addItems(["EUR", "USD"])
-        self.gamma_ccy.setFixedWidth(50)
-        grid.addWidget(self.gamma_ccy, 0, 1)
+        self.gamma_ccy_label = QLabel("EUR")
+        self.gamma_ccy_label.setFixedWidth(50)
+        grid.addWidget(self.gamma_ccy_label, 0, 1)
         self.gamma_display = QLineEdit()
         self.gamma_display.setReadOnly(True)
         grid.addWidget(self.gamma_display, 0, 2)
@@ -388,6 +411,177 @@ class FXOptionPricer(QMainWindow):
         self.refresh_btn.clicked.connect(self._on_refresh_data)
         parent_layout.addWidget(self.refresh_btn)
 
+    def _create_shock_params_section(self, parent_layout: QVBoxLayout) -> None:
+        """Create the shock parameters section."""
+        header = SectionHeader("SHOCK Params")
+        parent_layout.addWidget(header)
+
+        grid = QGridLayout()
+        grid.setSpacing(2)
+
+        # Start Date
+        grid.addWidget(QLabel("Start Date"), 0, 0)
+        self.shock_start_date = QDateEdit()
+        self.shock_start_date.setCalendarPopup(True)
+        self.shock_start_date.setDate(QDate.currentDate().addMonths(-1))
+        self.shock_start_date.setDisplayFormat("MM/dd/yy")
+        grid.addWidget(self.shock_start_date, 0, 1)
+
+        # End Date
+        grid.addWidget(QLabel("End Date"), 1, 0)
+        self.shock_end_date = QDateEdit()
+        self.shock_end_date.setCalendarPopup(True)
+        self.shock_end_date.setDate(QDate.currentDate())
+        self.shock_end_date.setDisplayFormat("MM/dd/yy")
+        grid.addWidget(self.shock_end_date, 1, 1)
+
+        parent_layout.addLayout(grid)
+
+        # Load Historical Data button
+        self.load_historical_btn = QPushButton("Load Historical Data")
+        self.load_historical_btn.clicked.connect(self._on_load_historical)
+        parent_layout.addWidget(self.load_historical_btn)
+
+        # Apply Shock button
+        self.apply_shock_btn = QPushButton("Apply Shock")
+        self.apply_shock_btn.clicked.connect(self._on_apply_shock)
+        self.apply_shock_btn.setEnabled(False)  # Disabled until historical data loaded
+        parent_layout.addWidget(self.apply_shock_btn)
+
+    def _create_shock_deltas_section(self, parent_layout: QVBoxLayout) -> None:
+        """Create the section showing calculated deltas."""
+        header = SectionHeader("Shock Deltas")
+        parent_layout.addWidget(header)
+
+        grid = QGridLayout()
+        grid.setSpacing(2)
+
+        row = 0
+
+        # Time Decay
+        grid.addWidget(QLabel("Time Decay"), row, 0)
+        self.shock_time_decay = QLineEdit()
+        self.shock_time_decay.setReadOnly(True)
+        grid.addWidget(self.shock_time_decay, row, 1)
+        row += 1
+
+        # Spot Change
+        grid.addWidget(QLabel("Spot Change"), row, 0)
+        self.shock_spot_change = QLineEdit()
+        self.shock_spot_change.setReadOnly(True)
+        grid.addWidget(self.shock_spot_change, row, 1)
+        row += 1
+
+        # Vol Change
+        grid.addWidget(QLabel("Vol Change"), row, 0)
+        self.shock_vol_change = QLineEdit()
+        self.shock_vol_change.setReadOnly(True)
+        grid.addWidget(self.shock_vol_change, row, 1)
+        row += 1
+
+        # Rate Change
+        grid.addWidget(QLabel("Rate Change"), row, 0)
+        self.shock_rate_change = QLineEdit()
+        self.shock_rate_change.setReadOnly(True)
+        grid.addWidget(self.shock_rate_change, row, 1)
+        row += 1
+
+        # Status
+        grid.addWidget(QLabel("Status"), row, 0)
+        self.shock_status = QLineEdit()
+        self.shock_status.setReadOnly(True)
+        self.shock_status.setText("Not loaded")
+        grid.addWidget(self.shock_status, row, 1)
+
+        parent_layout.addLayout(grid)
+
+    def _create_shocked_results_section(self, parent_layout: QVBoxLayout) -> None:
+        """Create the shocked results section."""
+        header = SectionHeader("Shocked Results")
+        parent_layout.addWidget(header)
+
+        grid = QGridLayout()
+        grid.setSpacing(2)
+
+        row = 0
+
+        # Shocked Expiry
+        grid.addWidget(QLabel("Shocked Expiry"), row, 0)
+        self.shocked_expiry_display = QLineEdit()
+        self.shocked_expiry_display.setReadOnly(True)
+        grid.addWidget(self.shocked_expiry_display, row, 1)
+        row += 1
+
+        # Shocked Spot
+        grid.addWidget(QLabel("Shocked Spot"), row, 0)
+        self.shocked_spot_display = QLineEdit()
+        self.shocked_spot_display.setReadOnly(True)
+        grid.addWidget(self.shocked_spot_display, row, 1)
+        row += 1
+
+        # Shocked Vol
+        grid.addWidget(QLabel("Shocked Vol"), row, 0)
+        self.shocked_vol_display = QLineEdit()
+        self.shocked_vol_display.setReadOnly(True)
+        grid.addWidget(self.shocked_vol_display, row, 1)
+        row += 1
+
+        # Shocked Forward
+        grid.addWidget(QLabel("Shocked Fwd"), row, 0)
+        self.shocked_forward_display = QLineEdit()
+        self.shocked_forward_display.setReadOnly(True)
+        grid.addWidget(self.shocked_forward_display, row, 1)
+        row += 1
+
+        parent_layout.addLayout(grid)
+
+        # Separator
+        parent_layout.addWidget(QLabel(""))
+
+        grid2 = QGridLayout()
+        grid2.setSpacing(2)
+
+        row = 0
+
+        # Shocked Premium
+        grid2.addWidget(QLabel("Shocked Premium"), row, 0)
+        self.shocked_premium_display = QLineEdit()
+        self.shocked_premium_display.setReadOnly(True)
+        grid2.addWidget(self.shocked_premium_display, row, 1)
+        row += 1
+
+        # P&L
+        grid2.addWidget(QLabel("P&L"), row, 0)
+        self.shocked_pnl_display = QLineEdit()
+        self.shocked_pnl_display.setReadOnly(True)
+        grid2.addWidget(self.shocked_pnl_display, row, 1)
+        row += 1
+
+        # Shocked Delta
+        grid2.addWidget(QLabel("Shocked Delta"), row, 0)
+        self.shocked_delta_display = QLineEdit()
+        self.shocked_delta_display.setReadOnly(True)
+        grid2.addWidget(self.shocked_delta_display, row, 1)
+        row += 1
+
+        # Shocked Gamma
+        grid2.addWidget(QLabel("Shocked Gamma"), row, 0)
+        self.shocked_gamma_display = QLineEdit()
+        self.shocked_gamma_display.setReadOnly(True)
+        grid2.addWidget(self.shocked_gamma_display, row, 1)
+        row += 1
+
+        # Shocked Vega
+        grid2.addWidget(QLabel("Shocked Vega"), row, 0)
+        self.shocked_vega_display = QLineEdit()
+        self.shocked_vega_display.setReadOnly(True)
+        grid2.addWidget(self.shocked_vega_display, row, 1)
+
+        parent_layout.addLayout(grid2)
+
+        # Add stretch
+        parent_layout.addStretch()
+
     def _apply_style(self) -> None:
         """Apply the dark theme stylesheet."""
         self.setStyleSheet(get_stylesheet())
@@ -400,6 +594,10 @@ class FXOptionPricer(QMainWindow):
         self.strike_input.valueChanged.connect(self._on_input_changed)
         self.call_put_combo.currentTextChanged.connect(self._on_input_changed)
         self.notional_input.valueChanged.connect(self._on_input_changed)
+        # Recalculate when delta type or premium currency changes
+        self.delta_type.currentTextChanged.connect(self._on_calculate)
+        self.premium_ccy.currentTextChanged.connect(self._on_calculate)
+        self.price_format.currentTextChanged.connect(self._on_calculate)
 
     def _set_defaults(self) -> None:
         """Set default values from config."""
@@ -552,8 +750,8 @@ class FXOptionPricer(QMainWindow):
         self.notional_ccy.clear()
         self.notional_ccy.addItems([base_ccy, quote_ccy])
 
-        self.gamma_ccy.clear()
-        self.gamma_ccy.addItems([base_ccy, quote_ccy])
+        # Update gamma currency label (follows base currency)
+        self.gamma_ccy_label.setText(base_ccy)
 
         self.premium_ccy.clear()
         self.premium_ccy.addItems([base_ccy, quote_ccy])
@@ -604,6 +802,12 @@ class FXOptionPricer(QMainWindow):
 
     def _on_calculate(self) -> None:
         """Perform the option pricing calculation."""
+        # Silently return if data not ready (e.g., when signals fire during init)
+        if not self._market_data:
+            return
+        if not self.expiry_date_display.text():
+            return
+            
         try:
             self._calculate()
         except Exception as e:
@@ -681,6 +885,10 @@ class FXOptionPricer(QMainWindow):
 
         result = GarmanKohlhagen.calculate_all(params)
 
+        # Save for shock analysis
+        self._last_pricing_result = result
+        self._last_pricing_params = params
+
         logger.info(f"Premium (domestic): {result.premium:.2f}")
         logger.info(f"Premium %: {result.premium_pct:.4f}")
         logger.info(f"Delta: {result.greeks.delta:.4f}")
@@ -751,17 +959,27 @@ class FXOptionPricer(QMainWindow):
         self.foreign_depo_display.setText(f"{r_for * 100:.3f}%")
         self.domestic_depo_display.setText(f"{r_dom * 100:.3f}%")
 
+        # Get selected currency for premium (gamma and vega follow)
+        premium_ccy = self.premium_ccy.currentText()
+
         # Gamma: Bloomberg convention is gamma cash per 1% spot move
+        # This gives the same value regardless of currency because S cancels out
         gamma_1pct = result.greeks.gamma * params.spot * 0.01 * params.notional
         self.gamma_display.setText(f"{gamma_1pct:,.2f}")
 
-        # Vega: per 1% vol move
-        vega_value = result.greeks.vega * params.notional
+        # Vega: per 1% vol move, in premium currency
+        # The calculated vega is in DOMESTIC currency (USD for EURUSD)
+        vega_dom = result.greeks.vega * params.notional
+        if premium_ccy == base_ccy:
+            # Convert to foreign currency (EUR)
+            vega_value = vega_dom / params.spot
+        else:
+            # Keep in domestic currency (USD)
+            vega_value = vega_dom
         self.vega_display.setText(f"{vega_value:,.2f}")
 
         # result.premium is in DOMESTIC currency (USD for EURUSD)
         # Convert to selected currency
-        premium_ccy = self.premium_ccy.currentText()
         if premium_ccy == quote_ccy:
             # Already in domestic (USD)
             premium_display = result.premium
@@ -769,9 +987,7 @@ class FXOptionPricer(QMainWindow):
             # Convert to foreign (EUR): divide by spot
             premium_display = result.premium / params.spot
 
-        # Price % - need to be consistent with premium currency
-        # result.premium_pct is % of foreign notional in domestic terms
-        # If notional is in EUR and we want % EUR: premium_in_eur / notional_eur * 100
+        # Price format
         price_format = self.price_format.currentText()
         if f"% {base_ccy}" in price_format:
             # % of foreign (EUR)
@@ -780,6 +996,7 @@ class FXOptionPricer(QMainWindow):
                 price_pct = premium_in_for / params.notional * 100
             else:
                 price_pct = premium_in_for / (params.notional / params.spot) * 100
+            self.price_display.setText(f"{price_pct:.4f}%")
         elif f"% {quote_ccy}" in price_format:
             # % of domestic (USD)
             if params.notional_currency == "FOR":
@@ -787,14 +1004,25 @@ class FXOptionPricer(QMainWindow):
             else:
                 notional_dom = params.notional
             price_pct = result.premium / notional_dom * 100
+            self.price_display.setText(f"{price_pct:.4f}%")
         else:
-            # Pips
-            price_pct = result.premium_pips
+            # Pips - show as number without %
+            price_pips = result.premium_pips
+            self.price_display.setText(f"{price_pips:.2f}")
 
-        self.price_display.setText(f"{price_pct:.4f}%")
         self.premium_display.setText(f"{premium_display:,.2f}")
         self.prem_date_display.setText(date.today().strftime("%m/%d/%y"))
-        self.delta_display.setText(f"{result.greeks.delta * 100:.4f}%")
+        
+        # Delta - spot or forward
+        delta_type = self.delta_type.currentText()
+        if delta_type == "Fwd":
+            # Forward delta = spot delta * exp(r_for * t)
+            import math
+            fwd_delta = result.greeks.delta * math.exp(r_for * params.time_to_expiry)
+            self.delta_display.setText(f"{fwd_delta * 100:.4f}%")
+        else:
+            self.delta_display.setText(f"{result.greeks.delta * 100:.4f}%")
+        
         self.hedge_display.setText(f"{hedge:,.2f}")
 
     def _on_refresh_data(self) -> None:
@@ -809,6 +1037,376 @@ class FXOptionPricer(QMainWindow):
                 "No Connection",
                 "Bloomberg is not connected. Please connect to Bloomberg first."
             )
+
+    def _on_load_historical(self) -> None:
+        """Load historical data for start and end dates."""
+        logger.info("=== LOAD HISTORICAL DATA STARTED ===")
+        
+        if not self._bbg_connected:
+            QMessageBox.warning(
+                self,
+                "No Connection",
+                "Bloomberg is not connected. Cannot load historical data."
+            )
+            logger.error("Bloomberg not connected")
+            return
+
+        # Get dates from QDateEdit widgets
+        start_qdate = self.shock_start_date.date()
+        end_qdate = self.shock_end_date.date()
+        
+        start_date = date(start_qdate.year(), start_qdate.month(), start_qdate.day())
+        end_date = date(end_qdate.year(), end_qdate.month(), end_qdate.day())
+        
+        logger.info(f"Start date: {start_date}, End date: {end_date}")
+
+        # Validate dates
+        if start_date >= end_date:
+            QMessageBox.warning(
+                self,
+                "Date Error",
+                "Start date must be before end date."
+            )
+            logger.error(f"Invalid date range: {start_date} >= {end_date}")
+            return
+
+        # Check if dates are business days
+        ccy_pair = self.asset_combo.currentText().replace("/", "")
+        tenors = self._config.tenors if self._config else ["1M", "3M", "6M", "1Y"]
+
+        self.statusBar().showMessage("Loading historical data...")
+        self.shock_status.setText("Loading...")
+        logger.info(f"Loading historical data for {ccy_pair}")
+
+        try:
+            conn = BloombergConnection.get_instance()
+            fetcher = HistoricalDataFetcher(conn)
+
+            # Fetch data for start date
+            logger.info(f"Fetching data for start date: {start_date}")
+            self._shock_start_data = fetcher.fetch_historical(ccy_pair, tenors, start_date)
+            
+            # Validate start data
+            if self._shock_start_data.get('spot', 0) == 0:
+                raise ValueError(f"No data available for start date {start_date}. It might be a weekend or holiday.")
+            
+            # Fetch data for end date
+            logger.info(f"Fetching data for end date: {end_date}")
+            self._shock_end_data = fetcher.fetch_historical(ccy_pair, tenors, end_date)
+            
+            # Validate end data
+            if self._shock_end_data.get('spot', 0) == 0:
+                raise ValueError(f"No data available for end date {end_date}. It might be a weekend or holiday.")
+
+            # Calculate deltas
+            logger.info("Calculating market data deltas...")
+            self._market_delta = MarketDataDelta.calculate(
+                self._shock_start_data,
+                self._shock_end_data,
+                start_date,
+                end_date
+            )
+
+            # Update UI with deltas
+            self._update_shock_deltas_display()
+
+            # Enable Apply Shock button
+            self.apply_shock_btn.setEnabled(True)
+            self.shock_status.setText("Ready to apply")
+            self.statusBar().showMessage("Historical data loaded successfully!")
+            logger.info("=== LOAD HISTORICAL DATA COMPLETE ===")
+
+        except Exception as e:
+            logger.error(f"Failed to load historical data: {e}", exc_info=True)
+            QMessageBox.warning(
+                self,
+                "Load Error",
+                f"Failed to load historical data:\n{str(e)}"
+            )
+            self.shock_status.setText("Load failed")
+            self.apply_shock_btn.setEnabled(False)
+            self.statusBar().showMessage("Load failed")
+
+    def _update_shock_deltas_display(self) -> None:
+        """Update the shock deltas display fields."""
+        if not self._market_delta:
+            return
+
+        logger.info("Updating shock deltas display")
+
+        # Time decay
+        self.shock_time_decay.setText(f"{self._market_delta.time_diff_days} days")
+
+        # Spot change
+        spot_pct = self._market_delta.spot_pct_change * 100
+        self.shock_spot_change.setText(f"{spot_pct:+.2f}%")
+
+        # Vol change (average)
+        if self._market_delta.atm_vol_diffs:
+            avg_vol_diff = sum(self._market_delta.atm_vol_diffs.values()) / len(self._market_delta.atm_vol_diffs)
+            self.shock_vol_change.setText(f"{avg_vol_diff * 100:+.2f}%")
+        else:
+            self.shock_vol_change.setText("N/A")
+
+        # Rate change (average)
+        if self._market_delta.usd_rate_diffs:
+            avg_rate_diff = sum(self._market_delta.usd_rate_diffs.values()) / len(self._market_delta.usd_rate_diffs)
+            self.shock_rate_change.setText(f"{avg_rate_diff * 100:+.2f}%")
+        else:
+            self.shock_rate_change.setText("N/A")
+
+    def _on_apply_shock(self) -> None:
+        """Apply the calculated shock to current market data and reprice."""
+        logger.info("=== APPLY SHOCK STARTED ===")
+
+        if not self._market_delta:
+            QMessageBox.warning(
+                self,
+                "No Shock Data",
+                "Please load historical data first."
+            )
+            return
+
+        if not self._market_data:
+            QMessageBox.warning(
+                self,
+                "No Market Data",
+                "Please load current market data first by calculating the option."
+            )
+            return
+
+        if not self._last_pricing_params:
+            QMessageBox.warning(
+                self,
+                "No Pricing",
+                "Please calculate the option first before applying shock."
+            )
+            return
+
+        self.statusBar().showMessage("Applying shock...")
+        self.shock_status.setText("Calculating...")
+
+        try:
+            # Get original expiry in days
+            original_expiry_days = int(self._last_pricing_params.time_to_expiry * 365)
+            logger.info(f"Original expiry: {original_expiry_days} days")
+
+            # Apply shock to market data
+            self._shocked_market_data = ShockCalculator.apply_shock(
+                self._market_data,
+                self._market_delta,
+                original_expiry_days
+            )
+
+            # Calculate shocked expiry
+            shocked_expiry_days = self._shocked_market_data.shocked_expiry_days
+            if shocked_expiry_days <= 0:
+                raise ValueError(f"Shocked expiry is {shocked_expiry_days} days. The shock period exceeds the option's remaining life.")
+
+            shocked_time_to_expiry = shocked_expiry_days / 365.0
+            logger.info(f"Shocked expiry: {shocked_expiry_days} days ({shocked_time_to_expiry:.4f} years)")
+
+            # Get shocked rates and vol for the option's expiry
+            shocked_spot = self._shocked_market_data.spot
+            
+            # Interpolate shocked domestic rate
+            shocked_dom_rate = self._get_interpolated_shocked_rate(
+                shocked_time_to_expiry,
+                self._shocked_market_data.domestic_rates
+            )
+            
+            # Interpolate shocked foreign rate
+            shocked_for_rate = self._get_interpolated_shocked_rate(
+                shocked_time_to_expiry,
+                self._shocked_market_data.foreign_rates
+            )
+            
+            # Interpolate shocked vol
+            shocked_vol = self._get_interpolated_shocked_vol(
+                shocked_time_to_expiry,
+                self._shocked_market_data.atm_vols
+            )
+
+            logger.info(f"Shocked spot: {shocked_spot:.5f}")
+            logger.info(f"Shocked domestic rate: {shocked_dom_rate:.4f}")
+            logger.info(f"Shocked foreign rate: {shocked_for_rate:.4f}")
+            logger.info(f"Shocked volatility: {shocked_vol:.4f}")
+
+            # Calculate shocked forward
+            shocked_forward = shocked_spot * math.exp((shocked_dom_rate - shocked_for_rate) * shocked_time_to_expiry)
+            logger.info(f"Shocked forward: {shocked_forward:.5f}")
+
+            # Build shocked option params
+            shocked_params = OptionParams(
+                spot=shocked_spot,
+                strike=self._last_pricing_params.strike,
+                domestic_rate=shocked_dom_rate,
+                foreign_rate=shocked_for_rate,
+                volatility=shocked_vol,
+                time_to_expiry=shocked_time_to_expiry,
+                is_call=self._last_pricing_params.is_call,
+                notional=self._last_pricing_params.notional,
+                notional_currency=self._last_pricing_params.notional_currency
+            )
+
+            # Calculate shocked option
+            logger.info("Calculating shocked option price...")
+            shocked_result = GarmanKohlhagen.calculate_all(shocked_params)
+
+            # Calculate P&L
+            original_premium = self._last_pricing_result.premium
+            shocked_premium = shocked_result.premium
+            pnl = shocked_premium - original_premium
+            logger.info(f"Original premium: {original_premium:.2f}")
+            logger.info(f"Shocked premium: {shocked_premium:.2f}")
+            logger.info(f"P&L: {pnl:+.2f}")
+
+            # Update shocked results display
+            self._update_shocked_results_display(
+                shocked_result,
+                shocked_params,
+                shocked_forward,
+                shocked_vol,
+                pnl
+            )
+
+            self.shock_status.setText("Applied")
+            self.statusBar().showMessage("Shock applied successfully!")
+            logger.info("=== APPLY SHOCK COMPLETE ===")
+
+        except Exception as e:
+            logger.error(f"Failed to apply shock: {e}", exc_info=True)
+            QMessageBox.warning(
+                self,
+                "Shock Error",
+                f"Failed to apply shock:\n{str(e)}"
+            )
+            self.shock_status.setText("Error")
+            self.statusBar().showMessage("Shock failed")
+
+    def _get_interpolated_shocked_rate(
+        self,
+        time_to_expiry: float,
+        rates: Dict[str, float]
+    ) -> float:
+        """Interpolate rate from shocked rates dictionary."""
+        if not rates:
+            return 0.0
+
+        from ..models.interpolation import linear_interpolate
+
+        times = []
+        values = []
+        for tenor, rate in rates.items():
+            t = tenor_to_years(tenor)
+            times.append(t)
+            values.append(rate)
+
+        # Sort by time
+        sorted_data = sorted(zip(times, values))
+        times = [d[0] for d in sorted_data]
+        values = [d[1] for d in sorted_data]
+
+        return linear_interpolate(time_to_expiry, times, values, extrapolate=True)
+
+    def _get_interpolated_shocked_vol(
+        self,
+        time_to_expiry: float,
+        vols: Dict[str, float]
+    ) -> float:
+        """Interpolate volatility from shocked vols dictionary."""
+        if not vols:
+            return 0.08  # Default
+
+        from ..models.interpolation import variance_interpolate
+
+        times = []
+        values = []
+        for tenor, vol in vols.items():
+            t = tenor_to_years(tenor)
+            times.append(t)
+            values.append(vol)
+
+        # Sort by time
+        sorted_data = sorted(zip(times, values))
+        times = [d[0] for d in sorted_data]
+        values = [d[1] for d in sorted_data]
+
+        return variance_interpolate(time_to_expiry, times, values, extrapolate=True)
+
+    def _update_shocked_results_display(
+        self,
+        shocked_result,
+        shocked_params: OptionParams,
+        shocked_forward: float,
+        shocked_vol: float,
+        pnl: float
+    ) -> None:
+        """Update the shocked results display fields."""
+        logger.info("Updating shocked results display")
+
+        ccy_pair = self.asset_combo.currentText().replace("/", "")
+        base_ccy = ccy_pair[:3]
+        quote_ccy = ccy_pair[3:]
+
+        # Shocked expiry
+        shocked_days = int(shocked_params.time_to_expiry * 365)
+        self.shocked_expiry_display.setText(f"{shocked_days} days")
+
+        # Shocked spot
+        self.shocked_spot_display.setText(f"{shocked_params.spot:.5f}")
+
+        # Shocked vol
+        self.shocked_vol_display.setText(f"{shocked_vol * 100:.3f}%")
+
+        # Shocked forward
+        self.shocked_forward_display.setText(f"{shocked_forward:.5f}")
+
+        # Get premium currency
+        premium_ccy = self.premium_ccy.currentText()
+
+        # Shocked premium
+        if premium_ccy == base_ccy:
+            shocked_premium_value = shocked_result.premium / shocked_params.spot
+        else:
+            shocked_premium_value = shocked_result.premium
+        self.shocked_premium_display.setText(f"{shocked_premium_value:,.2f} {premium_ccy}")
+
+        # P&L
+        if premium_ccy == base_ccy:
+            pnl_value = pnl / shocked_params.spot
+        else:
+            pnl_value = pnl
+        
+        # Color P&L: green for profit, red for loss
+        if pnl_value >= 0:
+            self.shocked_pnl_display.setStyleSheet("color: #00FF00;")
+        else:
+            self.shocked_pnl_display.setStyleSheet("color: #FF4444;")
+        self.shocked_pnl_display.setText(f"{pnl_value:+,.2f} {premium_ccy}")
+
+        # Shocked delta
+        r_for = shocked_params.foreign_rate
+        t = shocked_params.time_to_expiry
+        delta_type = self.delta_type.currentText()
+        if delta_type == "Fwd":
+            shocked_delta = shocked_result.greeks.delta * math.exp(r_for * t)
+        else:
+            shocked_delta = shocked_result.greeks.delta
+        self.shocked_delta_display.setText(f"{shocked_delta * 100:.4f}%")
+
+        # Shocked gamma (in base currency)
+        gamma_dom = shocked_result.greeks.gamma * shocked_params.notional
+        gamma_value = gamma_dom / shocked_params.spot
+        self.shocked_gamma_display.setText(f"{gamma_value:,.0f} {base_ccy}")
+
+        # Shocked vega
+        vega_dom = shocked_result.greeks.vega * shocked_params.notional
+        if premium_ccy == base_ccy:
+            vega_value = vega_dom / shocked_params.spot
+        else:
+            vega_value = vega_dom
+        self.shocked_vega_display.setText(f"{vega_value:,.0f} {premium_ccy}")
 
     def closeEvent(self, event) -> None:
         """Handle window close."""
