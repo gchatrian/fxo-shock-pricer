@@ -1,9 +1,11 @@
 """
 Bloomberg market data fetcher for FX options.
 Retrieves spot rates, forward points, volatility surface, and interest rates.
+Supports non-USD crosses with implied rate calculation.
 """
 
 import logging
+import math
 from dataclasses import dataclass, field
 from datetime import date
 from typing import Dict, List, Optional, Any
@@ -43,7 +45,7 @@ class VolSmileData:
     @property
     def vol_25p(self) -> float:
         """25 Delta Put volatility."""
-        return self.atm - 0.5 * self.rr25 + self.bf25
+        return self.vol_25c - self.rr25
 
     @property
     def vol_10c(self) -> float:
@@ -53,30 +55,61 @@ class VolSmileData:
     @property
     def vol_10p(self) -> float:
         """10 Delta Put volatility."""
-        return self.atm - 0.5 * self.rr10 + self.bf10
+        return self.vol_10c - self.rr10
+
+
+@dataclass
+class ForwardData:
+    """Forward data for a currency pair."""
+    spot: float
+    forward_points: Dict[str, float] = field(default_factory=dict)  # tenor -> points
+    forward_rates: Dict[str, float] = field(default_factory=dict)   # tenor -> outright rate
+    n_pips: int = 4
 
 
 @dataclass
 class MarketData:
     """Container for all market data for a currency pair."""
     ccy_pair: str
+    f_ccy: str
+    d_ccy: str
     spot: float
+    is_dollar_cross: bool
+
+    # Forward data
     forward_points: Dict[str, float] = field(default_factory=dict)
+    forward_rates: Dict[str, float] = field(default_factory=dict)
+
+    # For non-USD crosses: USD cross data
+    f_ccy_vs_usd: Optional[str] = None
+    f_ccy_vs_usd_spot: Optional[float] = None
+    f_ccy_vs_usd_forwards: Dict[str, float] = field(default_factory=dict)
+
+    d_ccy_vs_usd: Optional[str] = None
+    d_ccy_vs_usd_spot: Optional[float] = None
+    d_ccy_vs_usd_forwards: Dict[str, float] = field(default_factory=dict)
+
+    # Volatility surface
     vol_smiles: Dict[str, VolSmileData] = field(default_factory=dict)
+
+    # Interest rates
     usd_rates: Dict[str, float] = field(default_factory=dict)
+    domestic_rates: Dict[str, float] = field(default_factory=dict)
+    foreign_rates: Dict[str, float] = field(default_factory=dict)
+
+    # Days to maturity mapping
+    days_to_maturity: Dict[str, int] = field(default_factory=dict)
+
     fetch_date: date = field(default_factory=date.today)
 
 
 class MarketDataFetcher:
     """
     Fetches FX market data from Bloomberg.
-
-    Usage:
-        connection = BloombergConnection.get_instance()
-        if connection.connect():
-            fetcher = MarketDataFetcher(connection)
-            data = fetcher.fetch_all("EURUSD", ["1M", "3M", "6M", "1Y"])
+    Supports USD crosses and non-USD crosses with implied rate calculation.
     """
+
+    BBG_CUTOFF = "BGN"
 
     def __init__(self, connection: BloombergConnection):
         """
@@ -142,7 +175,6 @@ class MarketDataFetcher:
                                         value = field_data.getElementAsFloat(field_name)
                                         results[ticker][field_name] = value
                                     except Exception:
-                                        # Field might be string or other type
                                         try:
                                             results[ticker][field_name] = field_data.getElementValue(field_name)
                                         except Exception as e:
@@ -153,242 +185,344 @@ class MarketDataFetcher:
 
         return results
 
-    def fetch_spot(self, ccy_pair: str) -> float:
+    def _calculate_cross_forward_from_usd(
+        self,
+        f_ccy_vs_usd_fwd: float,
+        d_ccy_vs_usd_fwd: float,
+        f_ccy: str,
+        d_ccy: str
+    ) -> float:
         """
-        Fetch spot rate for a currency pair.
+        Calculate cross forward from USD forwards.
+
+        The formula depends on quoting convention:
+        - EUR, GBP, AUD, NZD are quoted as xxxUSD ('f')
+        - CHF, JPY, CAD are quoted as USDxxx ('d')
 
         Args:
-            ccy_pair: Currency pair (e.g., "EURUSD")
+            f_ccy_vs_usd_fwd: Forward of foreign currency vs USD
+            d_ccy_vs_usd_fwd: Forward of domestic currency vs USD
+            f_ccy: Foreign currency code
+            d_ccy: Domestic currency code
 
         Returns:
-            Spot rate
+            Cross forward rate
         """
-        ticker = TickerBuilder.spot_ticker(ccy_pair)
-        results = self._request_data([ticker], ["PX_LAST"])
+        f_conv = TickerBuilder.fx_usd_quoting_convention(f_ccy)
+        d_conv = TickerBuilder.fx_usd_quoting_convention(d_ccy)
 
-        if ticker not in results or "PX_LAST" not in results[ticker]:
-            raise DataFetchError(f"Failed to fetch spot for {ccy_pair}")
+        if f_conv == 'f' and d_conv == 'f':
+            # xxxUSD / yyyUSD (e.g., AUDNZD = AUDUSD / NZDUSD)
+            return f_ccy_vs_usd_fwd / d_ccy_vs_usd_fwd
+        elif f_conv == 'f' and d_conv == 'd':
+            # xxxUSD * USDyyy (e.g., EURCHF = EURUSD * USDCHF)
+            return f_ccy_vs_usd_fwd * d_ccy_vs_usd_fwd
+        elif f_conv == 'd' and d_conv == 'f':
+            # 1 / (USDxxx * yyyUSD) - rare case
+            return 1 / (f_ccy_vs_usd_fwd * d_ccy_vs_usd_fwd)
+        else:  # f_conv == 'd' and d_conv == 'd'
+            # USDyyy / USDxxx (e.g., CHFJPY = USDJPY / USDCHF)
+            return d_ccy_vs_usd_fwd / f_ccy_vs_usd_fwd
 
-        return results[ticker]["PX_LAST"]
-
-    def fetch_forward_points(self, ccy_pair: str, tenors: List[str]) -> Dict[str, float]:
+    def _calculate_implied_rate(
+        self,
+        ccy: str,
+        ccy_vs_usd_spot: float,
+        ccy_vs_usd_fwd: float,
+        usd_rate: float,
+        tau: float
+    ) -> float:
         """
-        Fetch forward points for all tenors.
+        Calculate implied interest rate from FX forward using interest rate parity.
+
+        Formula: F = S * (1 + r_d * tau) / (1 + r_f * tau)
+        For xxxUSD (f): r_ccy = (S/F * (1 + r_usd * tau) - 1) / tau
+        For USDxxx (d): r_ccy = (F/S * (1 + r_usd * tau) - 1) / tau
 
         Args:
-            ccy_pair: Currency pair
-            tenors: List of tenors
+            ccy: Currency code
+            ccy_vs_usd_spot: Spot rate of ccy vs USD
+            ccy_vs_usd_fwd: Forward rate of ccy vs USD
+            usd_rate: USD interest rate (decimal)
+            tau: Time to maturity in years
 
         Returns:
-            Dictionary mapping tenor -> forward points
+            Implied interest rate (decimal)
         """
-        tickers = [TickerBuilder.forward_points_ticker(ccy_pair, tenor) for tenor in tenors]
-        results = self._request_data(tickers, ["PX_LAST"])
+        if tau <= 0:
+            return usd_rate
 
-        forward_points = {}
-        for tenor, ticker in zip(tenors, tickers):
-            if ticker in results and "PX_LAST" in results[ticker]:
-                forward_points[tenor] = results[ticker]["PX_LAST"]
-            else:
-                logger.warning(f"Missing forward points for {ccy_pair} {tenor}")
+        convention = TickerBuilder.fx_usd_quoting_convention(ccy)
 
-        return forward_points
+        if convention == 'f':
+            # xxxUSD: USD is domestic, ccy is foreign
+            # F = S * (1 + r_usd * tau) / (1 + r_ccy * tau)
+            # r_ccy = (S/F * (1 + r_usd * tau) - 1) / tau
+            implied = (ccy_vs_usd_spot / ccy_vs_usd_fwd * (1 + usd_rate * tau) - 1) / tau
+        else:
+            # USDxxx: ccy is domestic, USD is foreign
+            # F = S * (1 + r_ccy * tau) / (1 + r_usd * tau)
+            # r_ccy = (F/S * (1 + r_usd * tau) - 1) / tau
+            implied = (ccy_vs_usd_fwd / ccy_vs_usd_spot * (1 + usd_rate * tau) - 1) / tau
 
-    def fetch_vol_surface(self, ccy_pair: str, tenors: List[str]) -> Dict[str, VolSmileData]:
-        """
-        Fetch volatility surface (ATM, RR, BF) for all tenors.
-
-        Args:
-            ccy_pair: Currency pair
-            tenors: List of tenors
-
-        Returns:
-            Dictionary mapping tenor -> VolSmileData
-        """
-        # Build all vol tickers
-        all_tickers = []
-        ticker_map = {}  # Map ticker -> (tenor, vol_type)
-
-        for tenor in tenors:
-            vol_tickers = TickerBuilder.get_all_vol_tickers(ccy_pair, tenor)
-            for vol_type, ticker in vol_tickers.items():
-                all_tickers.append(ticker)
-                ticker_map[ticker] = (tenor, vol_type)
-
-        # Fetch all at once
-        results = self._request_data(all_tickers, ["PX_LAST"])
-
-        # Parse results into VolSmileData
-        raw_data: Dict[str, Dict[str, float]] = {tenor: {} for tenor in tenors}
-
-        for ticker, (tenor, vol_type) in ticker_map.items():
-            if ticker in results and "PX_LAST" in results[ticker]:
-                raw_data[tenor][vol_type] = results[ticker]["PX_LAST"]
-
-        # Create VolSmileData objects
-        vol_smiles = {}
-        for tenor in tenors:
-            data = raw_data[tenor]
-            if all(key in data for key in ["ATM", "RR25", "BF25", "RR10", "BF10"]):
-                vol_smiles[tenor] = VolSmileData(
-                    tenor=tenor,
-                    atm=data["ATM"] / 100.0,  # Convert from percentage
-                    rr25=data["RR25"] / 100.0,
-                    bf25=data["BF25"] / 100.0,
-                    rr10=data["RR10"] / 100.0,
-                    bf10=data["BF10"] / 100.0,
-                )
-            else:
-                logger.warning(f"Incomplete vol data for {ccy_pair} {tenor}: {data.keys()}")
-
-        return vol_smiles
-
-    def fetch_usd_rates(self, tenors: List[str], curve_prefix: str = "SOFR") -> Dict[str, float]:
-        """
-        Fetch USD interest rates for all tenors.
-
-        Args:
-            tenors: List of tenors
-            curve_prefix: Curve identifier (e.g., "SOFR")
-
-        Returns:
-            Dictionary mapping tenor -> rate
-        """
-        tickers = [TickerBuilder.usd_rate_ticker(curve_prefix, tenor) for tenor in tenors]
-        results = self._request_data(tickers, ["PX_LAST"])
-
-        rates = {}
-        for tenor, ticker in zip(tenors, tickers):
-            if ticker in results and "PX_LAST" in results[ticker]:
-                rates[tenor] = results[ticker]["PX_LAST"] / 100.0  # Convert from percentage
-            else:
-                logger.warning(f"Missing USD rate for {tenor}")
-
-        return rates
+        return implied
 
     def fetch_all(
         self,
         ccy_pair: str,
         tenors: List[str],
-        usd_curve_prefix: str = "SOFR"
+        days_to_maturity: Optional[Dict[str, int]] = None
     ) -> MarketData:
         """
         Fetch all market data needed for pricing.
 
         Args:
-            ccy_pair: Currency pair
+            ccy_pair: Currency pair (e.g., "EURUSD", "EURGBP")
             tenors: List of tenors
-            usd_curve_prefix: USD curve identifier
+            days_to_maturity: Optional dict mapping tenor -> days
 
         Returns:
             MarketData object with all data
         """
-        spot = self.fetch_spot(ccy_pair)
-        forward_points = self.fetch_forward_points(ccy_pair, tenors)
-        vol_smiles = self.fetch_vol_surface(ccy_pair, tenors)
-        usd_rates = self.fetch_usd_rates(tenors, usd_curve_prefix)
-
-        return MarketData(
-            ccy_pair=ccy_pair,
-            spot=spot,
-            forward_points=forward_points,
-            vol_smiles=vol_smiles,
-            usd_rates=usd_rates,
-            fetch_date=date.today()
-        )
-
-
-class MockMarketDataFetcher:
-    """
-    Mock data fetcher for testing without Bloomberg connection.
-    Returns synthetic market data for common currency pairs.
-    """
-
-    MOCK_DATA = {
-        "EURUSD": {
-            "spot": 1.0850,
-            "forward_points": {
-                "1W": 2.5, "2W": 5.0, "1M": 12.0, "2M": 25.0, "3M": 38.0,
-                "6M": 78.0, "9M": 120.0, "1Y": 165.0, "18M": 250.0, "2Y": 340.0
-            },
-            "atm_vols": {
-                "1W": 8.5, "2W": 8.3, "1M": 8.0, "2M": 7.8, "3M": 7.6,
-                "6M": 7.5, "9M": 7.4, "1Y": 7.3, "18M": 7.2, "2Y": 7.1
-            },
-            "rr25": {
-                "1W": -0.3, "2W": -0.35, "1M": -0.4, "2M": -0.45, "3M": -0.5,
-                "6M": -0.6, "9M": -0.7, "1Y": -0.8, "18M": -0.9, "2Y": -1.0
-            },
-            "bf25": {
-                "1W": 0.15, "2W": 0.18, "1M": 0.2, "2M": 0.22, "3M": 0.25,
-                "6M": 0.3, "9M": 0.35, "1Y": 0.4, "18M": 0.45, "2Y": 0.5
-            },
-            "rr10": {
-                "1W": -0.6, "2W": -0.7, "1M": -0.8, "2M": -0.9, "3M": -1.0,
-                "6M": -1.2, "9M": -1.4, "1Y": -1.6, "18M": -1.8, "2Y": -2.0
-            },
-            "bf10": {
-                "1W": 0.4, "2W": 0.45, "1M": 0.5, "2M": 0.55, "3M": 0.6,
-                "6M": 0.7, "9M": 0.8, "1Y": 0.9, "18M": 1.0, "2Y": 1.1
-            },
-        },
-        "USD_RATES": {
-            "1W": 5.30, "2W": 5.31, "1M": 5.32, "2M": 5.33, "3M": 5.34,
-            "6M": 5.20, "9M": 5.05, "1Y": 4.90, "18M": 4.60, "2Y": 4.40
-        }
-    }
-
-    def fetch_all(
-        self,
-        ccy_pair: str,
-        tenors: List[str],
-        usd_curve_prefix: str = "SOFR"
-    ) -> MarketData:
-        """Fetch mock market data."""
         ccy_pair = ccy_pair.upper().replace("/", "")
+        f_ccy, d_ccy = TickerBuilder.parse_currency_pair(ccy_pair)
+        is_dollar = TickerBuilder.is_dollar_cross(ccy_pair)
+        n_pips = TickerBuilder.get_n_pips(ccy_pair)
+        pip_scale = TickerBuilder.get_pip_scale(ccy_pair)
 
-        if ccy_pair not in self.MOCK_DATA:
-            # Use EURUSD as template with adjusted spot
-            data = self.MOCK_DATA["EURUSD"].copy()
-            if ccy_pair == "GBPUSD":
-                data["spot"] = 1.2650
-            elif ccy_pair == "USDJPY":
-                data["spot"] = 149.50
-            elif ccy_pair == "AUDUSD":
-                data["spot"] = 0.6550
-            elif ccy_pair == "USDCAD":
-                data["spot"] = 1.3550
-            elif ccy_pair == "USDCHF":
-                data["spot"] = 0.8850
-            else:
-                data["spot"] = 1.0000
-        else:
-            data = self.MOCK_DATA[ccy_pair]
+        # Build ticker lists
+        all_tickers = []
+        ticker_mapping = {}
 
-        # Build forward points
-        forward_points = {t: data["forward_points"].get(t, 0.0) for t in tenors}
+        # Spot ticker
+        spot_ticker = TickerBuilder.spot_ticker(ccy_pair, self.BBG_CUTOFF)
+        all_tickers.append(spot_ticker)
+        ticker_mapping["spot"] = spot_ticker
 
-        # Build vol smiles
-        vol_smiles = {}
+        # USD curve tickers
+        usd_curve_tickers = TickerBuilder.get_usd_curve_tickers(tenors, self.BBG_CUTOFF)
+        all_tickers.extend(usd_curve_tickers.values())
+        ticker_mapping["usd_rates"] = usd_curve_tickers
+
+        # Forward points for main cross
+        fwd_tickers = {}
         for tenor in tenors:
-            if tenor in data["atm_vols"]:
-                vol_smiles[tenor] = VolSmileData(
-                    tenor=tenor,
-                    atm=data["atm_vols"][tenor] / 100.0,
-                    rr25=data["rr25"].get(tenor, 0.0) / 100.0,
-                    bf25=data["bf25"].get(tenor, 0.0) / 100.0,
-                    rr10=data["rr10"].get(tenor, 0.0) / 100.0,
-                    bf10=data["bf10"].get(tenor, 0.0) / 100.0,
-                )
+            ticker = TickerBuilder.forward_points_ticker(ccy_pair, tenor, self.BBG_CUTOFF)
+            all_tickers.append(ticker)
+            fwd_tickers[tenor] = ticker
+        ticker_mapping["forwards"] = fwd_tickers
 
-        # USD rates
-        usd_rates = {t: self.MOCK_DATA["USD_RATES"].get(t, 5.0) / 100.0 for t in tenors}
+        # Non-USD cross: add USD cross data
+        f_ccy_vs_usd = None
+        d_ccy_vs_usd = None
+        if not is_dollar:
+            f_ccy_vs_usd = TickerBuilder.get_ccy_code_vs_usd(f_ccy)
+            d_ccy_vs_usd = TickerBuilder.get_ccy_code_vs_usd(d_ccy)
 
-        return MarketData(
+            # Spot tickers for USD crosses
+            f_spot_ticker = TickerBuilder.spot_ticker(f_ccy_vs_usd, self.BBG_CUTOFF)
+            d_spot_ticker = TickerBuilder.spot_ticker(d_ccy_vs_usd, self.BBG_CUTOFF)
+            all_tickers.extend([f_spot_ticker, d_spot_ticker])
+            ticker_mapping["f_ccy_vs_usd_spot"] = f_spot_ticker
+            ticker_mapping["d_ccy_vs_usd_spot"] = d_spot_ticker
+
+            # Forward tickers for USD crosses
+            f_fwd_tickers = {}
+            d_fwd_tickers = {}
+            for tenor in tenors:
+                f_ticker = TickerBuilder.forward_points_ticker(f_ccy_vs_usd, tenor, self.BBG_CUTOFF)
+                d_ticker = TickerBuilder.forward_points_ticker(d_ccy_vs_usd, tenor, self.BBG_CUTOFF)
+                all_tickers.extend([f_ticker, d_ticker])
+                f_fwd_tickers[tenor] = f_ticker
+                d_fwd_tickers[tenor] = d_ticker
+            ticker_mapping["f_ccy_vs_usd_forwards"] = f_fwd_tickers
+            ticker_mapping["d_ccy_vs_usd_forwards"] = d_fwd_tickers
+
+        # Volatility tickers
+        vol_tickers = {}
+        for tenor in tenors:
+            vol_tickers[tenor] = TickerBuilder.get_all_vol_tickers(ccy_pair, tenor)
+            all_tickers.extend(vol_tickers[tenor].values())
+        ticker_mapping["vols"] = vol_tickers
+
+        # Fetch all data from Bloomberg
+        results = self._request_data(all_tickers, ["PX_LAST"])
+
+        # Parse results
+        market_data = MarketData(
             ccy_pair=ccy_pair,
-            spot=data["spot"],
-            forward_points=forward_points,
-            vol_smiles=vol_smiles,
-            usd_rates=usd_rates,
-            fetch_date=date.today()
+            f_ccy=f_ccy,
+            d_ccy=d_ccy,
+            spot=results.get(spot_ticker, {}).get("PX_LAST", 0.0),
+            is_dollar_cross=is_dollar,
+            f_ccy_vs_usd=f_ccy_vs_usd,
+            d_ccy_vs_usd=d_ccy_vs_usd,
+            days_to_maturity=days_to_maturity or {}
         )
+
+        # Parse USD rates
+        for tenor, ticker in usd_curve_tickers.items():
+            if ticker in results and "PX_LAST" in results[ticker]:
+                market_data.usd_rates[tenor] = results[ticker]["PX_LAST"] / 100.0
+
+        # Parse non-USD cross spots and forwards
+        if not is_dollar:
+            f_spot_ticker = ticker_mapping["f_ccy_vs_usd_spot"]
+            d_spot_ticker = ticker_mapping["d_ccy_vs_usd_spot"]
+            market_data.f_ccy_vs_usd_spot = results.get(f_spot_ticker, {}).get("PX_LAST")
+            market_data.d_ccy_vs_usd_spot = results.get(d_spot_ticker, {}).get("PX_LAST")
+
+            f_n_pips = TickerBuilder.get_n_pips(f_ccy_vs_usd)
+            d_n_pips = TickerBuilder.get_n_pips(d_ccy_vs_usd)
+            f_pip_scale = TickerBuilder.get_pip_scale(f_ccy_vs_usd)
+            d_pip_scale = TickerBuilder.get_pip_scale(d_ccy_vs_usd)
+
+            for tenor in tenors:
+                f_ticker = ticker_mapping["f_ccy_vs_usd_forwards"][tenor]
+                d_ticker = ticker_mapping["d_ccy_vs_usd_forwards"][tenor]
+
+                if f_ticker in results and "PX_LAST" in results[f_ticker]:
+                    fwd_pts = results[f_ticker]["PX_LAST"]
+                    market_data.f_ccy_vs_usd_forwards[tenor] = round(
+                        market_data.f_ccy_vs_usd_spot + fwd_pts / f_pip_scale, f_n_pips
+                    )
+
+                if d_ticker in results and "PX_LAST" in results[d_ticker]:
+                    fwd_pts = results[d_ticker]["PX_LAST"]
+                    market_data.d_ccy_vs_usd_forwards[tenor] = round(
+                        market_data.d_ccy_vs_usd_spot + fwd_pts / d_pip_scale, d_n_pips
+                    )
+
+        # Parse forward points and calculate outright forwards
+        for tenor in tenors:
+            ticker = fwd_tickers[tenor]
+            if ticker in results and "PX_LAST" in results[ticker]:
+                fwd_pts = results[ticker]["PX_LAST"]
+                market_data.forward_points[tenor] = fwd_pts
+                fwd_rate = round(market_data.spot + fwd_pts / pip_scale, n_pips)
+                market_data.forward_rates[tenor] = fwd_rate
+            elif not is_dollar:
+                # Calculate from USD crosses if direct forward not available
+                f_fwd = market_data.f_ccy_vs_usd_forwards.get(tenor)
+                d_fwd = market_data.d_ccy_vs_usd_forwards.get(tenor)
+                if f_fwd is not None and d_fwd is not None:
+                    cross_fwd = self._calculate_cross_forward_from_usd(f_fwd, d_fwd, f_ccy, d_ccy)
+                    market_data.forward_rates[tenor] = round(cross_fwd, n_pips)
+                    market_data.forward_points[tenor] = (cross_fwd - market_data.spot) * pip_scale
+                    logger.info(f"{ccy_pair} {tenor}: calculated forward from USD crosses")
+
+        # Calculate implied rates
+        logger.info(f"=== CALCULATING IMPLIED RATES FOR {ccy_pair} ===")
+        logger.info(f"is_dollar_cross: {is_dollar}, f_ccy: {f_ccy}, d_ccy: {d_ccy}")
+        logger.info(f"spot: {market_data.spot}")
+        logger.info(f"forward_rates: {market_data.forward_rates}")
+        logger.info(f"usd_rates: {market_data.usd_rates}")
+
+        for tenor in tenors:
+            dtm = days_to_maturity.get(tenor, 30) if days_to_maturity else 30
+            tau = dtm / 365.0
+            usd_rate = market_data.usd_rates.get(tenor, 0.05)
+
+            logger.info(f"--- Tenor {tenor}: dtm={dtm}, tau={tau:.4f}, usd_rate={usd_rate:.4f}")
+
+            # For USD crosses (EURUSD, USDJPY, etc.)
+            if is_dollar:
+                if d_ccy == "USD":
+                    # e.g., EURUSD: USD is domestic, EUR is foreign
+                    market_data.domestic_rates[tenor] = usd_rate
+                    logger.info(f"  USD is domestic -> domestic_rate = {usd_rate:.4f}")
+
+                    # Calculate EUR rate from forward using interest rate parity
+                    # F = S * (1 + r_dom * tau) / (1 + r_for * tau)
+                    # r_for = (S / F * (1 + r_dom * tau) - 1) / tau
+                    fwd = market_data.forward_rates.get(tenor)
+                    logger.info(f"  forward_rate for {tenor}: {fwd}")
+
+                    if fwd is not None and fwd > 0 and market_data.spot > 0 and tau > 0:
+                        implied_for = (market_data.spot / fwd * (1 + usd_rate * tau) - 1) / tau
+                        market_data.foreign_rates[tenor] = round(implied_for, 6)
+                        logger.info(f"  IMPLIED foreign_rate ({f_ccy}) = {implied_for:.6f}")
+                    else:
+                        market_data.foreign_rates[tenor] = usd_rate
+                        logger.warning(f"  FALLBACK: foreign_rate = usd_rate (fwd={fwd}, spot={market_data.spot}, tau={tau})")
+
+                elif f_ccy == "USD":
+                    # e.g., USDJPY: USD is foreign, JPY is domestic
+                    market_data.foreign_rates[tenor] = usd_rate
+                    logger.info(f"  USD is foreign -> foreign_rate = {usd_rate:.4f}")
+
+                    # Calculate domestic rate from forward
+                    fwd = market_data.forward_rates.get(tenor)
+                    logger.info(f"  forward_rate for {tenor}: {fwd}")
+
+                    if fwd is not None and fwd > 0 and market_data.spot > 0 and tau > 0:
+                        implied_dom = (fwd / market_data.spot * (1 + usd_rate * tau) - 1) / tau
+                        market_data.domestic_rates[tenor] = round(implied_dom, 6)
+                        logger.info(f"  IMPLIED domestic_rate ({d_ccy}) = {implied_dom:.6f}")
+                    else:
+                        market_data.domestic_rates[tenor] = usd_rate
+                        logger.warning(f"  FALLBACK: domestic_rate = usd_rate")
+
+            # For non-USD crosses (EURGBP, AUDNZD, etc.)
+            else:
+                # Calculate both rates from their USD crosses
+                if market_data.d_ccy_vs_usd_spot and tenor in market_data.d_ccy_vs_usd_forwards:
+                    d_rate = self._calculate_implied_rate(
+                        d_ccy,
+                        market_data.d_ccy_vs_usd_spot,
+                        market_data.d_ccy_vs_usd_forwards[tenor],
+                        usd_rate,
+                        tau
+                    )
+                    market_data.domestic_rates[tenor] = round(d_rate, 6)
+                    logger.info(f"  Cross: domestic_rate ({d_ccy}) = {d_rate:.6f}")
+                else:
+                    market_data.domestic_rates[tenor] = usd_rate
+                    logger.warning(f"  Cross FALLBACK: domestic_rate = usd_rate")
+
+                if market_data.f_ccy_vs_usd_spot and tenor in market_data.f_ccy_vs_usd_forwards:
+                    f_rate = self._calculate_implied_rate(
+                        f_ccy,
+                        market_data.f_ccy_vs_usd_spot,
+                        market_data.f_ccy_vs_usd_forwards[tenor],
+                        usd_rate,
+                        tau
+                    )
+                    market_data.foreign_rates[tenor] = round(f_rate, 6)
+                    logger.info(f"  Cross: foreign_rate ({f_ccy}) = {f_rate:.6f}")
+                else:
+                    market_data.foreign_rates[tenor] = usd_rate
+                    logger.warning(f"  Cross FALLBACK: foreign_rate = usd_rate")
+
+        logger.info(f"=== FINAL RATES ===")
+        logger.info(f"domestic_rates: {market_data.domestic_rates}")
+        logger.info(f"foreign_rates: {market_data.foreign_rates}")
+
+        # Parse volatility data
+        for tenor in tenors:
+            vol_t = vol_tickers[tenor]
+            atm_ticker = vol_t["ATM"]
+            rr25_ticker = vol_t["RR25"]
+            bf25_ticker = vol_t["BF25"]
+            rr10_ticker = vol_t["RR10"]
+            bf10_ticker = vol_t["BF10"]
+
+            atm = results.get(atm_ticker, {}).get("PX_LAST")
+            rr25 = results.get(rr25_ticker, {}).get("PX_LAST")
+            bf25 = results.get(bf25_ticker, {}).get("PX_LAST")
+            rr10 = results.get(rr10_ticker, {}).get("PX_LAST")
+            bf10 = results.get(bf10_ticker, {}).get("PX_LAST")
+
+            if all(v is not None for v in [atm, rr25, bf25, rr10, bf10]):
+                market_data.vol_smiles[tenor] = VolSmileData(
+                    tenor=tenor,
+                    atm=atm / 100.0,
+                    rr25=rr25 / 100.0,
+                    bf25=bf25 / 100.0,
+                    rr10=rr10 / 100.0,
+                    bf10=bf10 / 100.0,
+                )
+            else:
+                logger.warning(f"Incomplete vol data for {ccy_pair} {tenor}")
+
+        return market_data

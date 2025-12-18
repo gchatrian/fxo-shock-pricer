@@ -324,15 +324,12 @@ class GarmanKohlhagen:
         )
 
         # Premium as percentage of notional
-        # If notional is in foreign currency, premium % = premium / spot * 100
-        # If notional is in domestic currency, premium % = premium * spot / notional * 100
         if params.notional_currency == "FOR":
             premium_pct = premium / params.spot * 100
         else:
             premium_pct = premium * 100
 
-        # Premium in pips (1 pip = 0.0001 for most pairs, 0.01 for JPY pairs)
-        # This is simplified; actual pip value depends on the pair
+        # Premium in pips
         premium_pips = premium * 10000
 
         return PricingResult(
@@ -359,9 +356,6 @@ class GarmanKohlhagen:
         """
         Calculate strike from delta using inverse G-K formula.
 
-        This is used to convert delta quotes (10D, 25D, etc.) to strikes
-        for volatility smile interpolation.
-
         Args:
             spot: Spot rate
             delta: Target delta (positive for calls, negative for puts)
@@ -380,20 +374,10 @@ class GarmanKohlhagen:
         sqrt_t = math.sqrt(t)
         df_for = math.exp(-r_for * t)
 
-        # For calls: delta = e^(-r_f*t) * N(d1)
-        # For puts: delta = e^(-r_f*t) * (N(d1) - 1)
-
         if is_call:
-            # d1 = N_inv(delta / df_for)
             d1 = norm.ppf(delta / df_for)
         else:
-            # d1 = N_inv((delta / df_for) + 1)
             d1 = norm.ppf((delta / df_for) + 1)
-
-        # From d1, calculate strike:
-        # d1 = [ln(S/K) + (r_d - r_f + 0.5*vol^2)*t] / (vol*sqrt(t))
-        # ln(S/K) = d1 * vol * sqrt(t) - (r_d - r_f + 0.5*vol^2)*t
-        # K = S * exp(-(d1 * vol * sqrt(t) - (r_d - r_f + 0.5*vol^2)*t))
 
         ln_s_over_k = d1 * vol * sqrt_t - (r_dom - r_for + 0.5 * vol ** 2) * t
         strike = spot * math.exp(-ln_s_over_k)
@@ -409,30 +393,23 @@ class GarmanKohlhagen:
         """
         Calculate delta hedge notional.
 
-        For a client buying an option, the dealer is short delta and needs
-        to buy the underlying to hedge.
-
         Args:
             params: Option parameters
             direction: Trade direction from client perspective
 
         Returns:
-            Hedge notional in the currency pair (e.g., EURUSD amount for EURUSD option)
+            Hedge notional
         """
         delta = cls.delta(params)
 
-        # Hedge notional = delta * notional
-        # The sign depends on direction: if client buys, dealer sells (negative from dealer perspective)
         if direction == Direction.CLIENT_BUYS:
-            hedge_sign = 1.0  # Dealer needs to buy underlying to hedge short option
+            hedge_sign = 1.0
         else:
-            hedge_sign = -1.0  # Dealer needs to sell underlying
+            hedge_sign = -1.0
 
         if params.notional_currency == "FOR":
-            # Notional is in foreign currency (e.g., EUR for EURUSD)
             hedge_notional = delta * params.notional * hedge_sign
         else:
-            # Notional is in domestic currency, convert to foreign
             hedge_notional = delta * params.notional / params.spot * hedge_sign
 
         return hedge_notional

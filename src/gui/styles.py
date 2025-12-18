@@ -3,26 +3,24 @@ Dark theme styles for FX Option Pricer GUI.
 Bloomberg-style dark theme with orange text on dark gray background.
 """
 
-# Color palette (from reference image)
+# Color palette
 COLORS = {
-    "background": "#2d2d2d",           # Dark gray background
-    "background_alt": "#3a3a3a",       # Slightly lighter for sections
-    "background_input": "#1a1a1a",     # Darker for input fields
-    "text_orange": "#ff8c00",          # Orange text (main)
-    "text_yellow": "#ffd700",          # Yellow for highlights/values
-    "text_white": "#ffffff",           # White for some labels
-    "text_gray": "#888888",            # Gray for disabled/secondary
-    "border": "#555555",               # Border color
-    "border_focus": "#ff8c00",         # Orange border on focus
-    "button_bg": "#4a4a4a",            # Button background
-    "button_hover": "#5a5a5a",         # Button hover
-    "selection": "#ff8c00",            # Selection background
-    "error": "#ff4444",                # Error color
+    "background": "#2d2d2d",
+    "background_alt": "#3a3a3a",
+    "background_input": "#1a1a1a",
+    "text_orange": "#ff8c00",
+    "text_yellow": "#ffd700",
+    "text_white": "#ffffff",
+    "text_gray": "#888888",
+    "border": "#555555",
+    "border_focus": "#ff8c00",
+    "button_bg": "#4a4a4a",
+    "button_hover": "#5a5a5a",
+    "selection": "#ff8c00",
+    "error": "#ff4444",
 }
 
-# Main stylesheet
 DARK_THEME_QSS = """
-/* Main Window */
 QMainWindow {
     background-color: %(background)s;
 }
@@ -31,19 +29,19 @@ QWidget {
     background-color: %(background)s;
     color: %(text_orange)s;
     font-family: "Consolas", "Courier New", monospace;
-    font-size: 11px;
+    font-size: 14px;
 }
 
-/* Labels */
 QLabel {
     background-color: transparent;
     color: %(text_orange)s;
     padding: 2px;
+    font-size: 14px;
 }
 
 QLabel[objectName="label_header"] {
     font-weight: bold;
-    font-size: 12px;
+    font-size: 15px;
 }
 
 QLabel[objectName="label_value"] {
@@ -55,15 +53,16 @@ QLabel[objectName="label_section"] {
     border: 1px solid %(border)s;
     padding: 3px 5px;
     font-weight: bold;
+    font-size: 14px;
 }
 
-/* Line Edit */
 QLineEdit {
     background-color: %(background_input)s;
     color: %(text_yellow)s;
     border: 1px solid %(border)s;
-    padding: 3px 5px;
+    padding: 4px 6px;
     selection-background-color: %(selection)s;
+    font-size: 14px;
 }
 
 QLineEdit:focus {
@@ -80,13 +79,13 @@ QLineEdit[readOnly="true"] {
     color: %(text_yellow)s;
 }
 
-/* Combo Box */
 QComboBox {
     background-color: %(background_input)s;
     color: %(text_orange)s;
     border: 1px solid %(border)s;
-    padding: 3px 5px;
+    padding: 4px 6px;
     min-width: 60px;
+    font-size: 14px;
 }
 
 QComboBox:hover {
@@ -100,9 +99,9 @@ QComboBox::drop-down {
 
 QComboBox::down-arrow {
     image: none;
-    border-left: 4px solid transparent;
-    border-right: 4px solid transparent;
-    border-top: 6px solid %(text_orange)s;
+    border-left: 5px solid transparent;
+    border-right: 5px solid transparent;
+    border-top: 7px solid %(text_orange)s;
     margin-right: 5px;
 }
 
@@ -112,15 +111,17 @@ QComboBox QAbstractItemView {
     border: 1px solid %(border)s;
     selection-background-color: %(selection)s;
     selection-color: %(background)s;
+    font-size: 14px;
 }
 
-/* Push Button */
 QPushButton {
     background-color: %(button_bg)s;
     color: %(text_orange)s;
     border: 1px solid %(border)s;
-    padding: 5px 15px;
-    min-width: 60px;
+    padding: 6px 18px;
+    min-width: 80px;
+    font-size: 14px;
+    font-weight: bold;
 }
 
 QPushButton:hover {
@@ -137,12 +138,12 @@ QPushButton:disabled {
     background-color: %(background)s;
 }
 
-/* Group Box */
 QGroupBox {
     background-color: %(background_alt)s;
     border: 1px solid %(border)s;
     margin-top: 10px;
     padding-top: 10px;
+    font-size: 14px;
 }
 
 QGroupBox::title {
@@ -153,24 +154,24 @@ QGroupBox::title {
     font-weight: bold;
 }
 
-/* Spin Box */
 QSpinBox, QDoubleSpinBox {
     background-color: %(background_input)s;
     color: %(text_yellow)s;
     border: 1px solid %(border)s;
-    padding: 3px 5px;
+    padding: 4px 6px;
+    font-size: 14px;
 }
 
 QSpinBox:focus, QDoubleSpinBox:focus {
     border: 1px solid %(border_focus)s;
 }
 
-/* Date Edit */
 QDateEdit {
     background-color: %(background_input)s;
     color: %(text_yellow)s;
     border: 1px solid %(border)s;
-    padding: 3px 5px;
+    padding: 4px 6px;
+    font-size: 14px;
 }
 
 QDateEdit:focus {
@@ -182,17 +183,16 @@ QDateEdit::drop-down {
     width: 20px;
 }
 
-/* Scroll Bar */
 QScrollBar:vertical {
     background-color: %(background)s;
-    width: 12px;
+    width: 14px;
     margin: 0px;
 }
 
 QScrollBar::handle:vertical {
     background-color: %(button_bg)s;
     min-height: 20px;
-    border-radius: 3px;
+    border-radius: 4px;
 }
 
 QScrollBar::handle:vertical:hover {
@@ -203,26 +203,25 @@ QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
     height: 0px;
 }
 
-/* Frame */
 QFrame {
     background-color: %(background)s;
     border: none;
 }
 
-QFrame[frameShape="4"] {  /* HLine */
+QFrame[frameShape="4"] {
     background-color: %(border)s;
     max-height: 1px;
 }
 
-QFrame[frameShape="5"] {  /* VLine */
+QFrame[frameShape="5"] {
     background-color: %(border)s;
     max-width: 1px;
 }
 
-/* Menu */
 QMenuBar {
     background-color: %(background)s;
     color: %(text_orange)s;
+    font-size: 14px;
 }
 
 QMenuBar::item:selected {
@@ -233,6 +232,7 @@ QMenu {
     background-color: %(background_input)s;
     color: %(text_orange)s;
     border: 1px solid %(border)s;
+    font-size: 14px;
 }
 
 QMenu::item:selected {
@@ -240,28 +240,28 @@ QMenu::item:selected {
     color: %(background)s;
 }
 
-/* Status Bar */
 QStatusBar {
     background-color: %(background_alt)s;
     color: %(text_orange)s;
     border-top: 1px solid %(border)s;
+    font-size: 13px;
 }
 
-/* Tool Tip */
 QToolTip {
     background-color: %(background_input)s;
     color: %(text_yellow)s;
     border: 1px solid %(border)s;
-    padding: 3px;
+    padding: 4px;
+    font-size: 13px;
 }
 
-/* Message Box */
 QMessageBox {
     background-color: %(background)s;
 }
 
 QMessageBox QLabel {
     color: %(text_orange)s;
+    font-size: 14px;
 }
 """ % COLORS
 

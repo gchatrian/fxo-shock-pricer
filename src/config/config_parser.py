@@ -19,9 +19,6 @@ class Config:
     # Currency pairs
     currency_pairs: List[str] = field(default_factory=list)
 
-    # USD curve
-    usd_curve_ticker_prefix: str = "SOFR"
-
     # Volatility
     delta_points: List[str] = field(default_factory=list)
 
@@ -62,7 +59,6 @@ class ConfigParser:
 
         Raises:
             FileNotFoundError: If config file doesn't exist.
-            ValueError: If required sections are missing.
         """
         if not self._config_path.exists():
             raise FileNotFoundError(f"Configuration file not found: {self._config_path}")
@@ -80,12 +76,6 @@ class ConfigParser:
         if self._parser.has_section("currency_pairs"):
             pairs_str = self._parser.get("currency_pairs", "pairs", fallback="")
             config.currency_pairs = [p.strip() for p in pairs_str.split(",") if p.strip()]
-
-        # Parse USD curve
-        if self._parser.has_section("usd_curve"):
-            config.usd_curve_ticker_prefix = self._parser.get(
-                "usd_curve", "ticker_prefix", fallback="SOFR"
-            )
 
         # Parse volatility
         if self._parser.has_section("volatility"):
@@ -108,12 +98,7 @@ class ConfigParser:
         return config
 
     def get_config(self) -> Config:
-        """
-        Get parsed config, parsing if not already done.
-
-        Returns:
-            Config object.
-        """
+        """Get parsed config, parsing if not already done."""
         if self._config is None:
             return self.parse()
         return self._config

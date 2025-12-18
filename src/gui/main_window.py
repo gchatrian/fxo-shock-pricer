@@ -3,7 +3,7 @@ Main window for FX Option Pricer.
 """
 
 import logging
-from datetime import date
+from datetime import date, timedelta
 from typing import Optional, Dict
 
 from PyQt6.QtWidgets import (
@@ -20,11 +20,11 @@ from .widgets import (
 )
 from ..config.config_parser import Config, load_config
 from ..bloomberg.connection import BloombergConnection, BloombergConnectionError
-from ..bloomberg.data_fetcher import MarketDataFetcher, MockMarketDataFetcher, MarketData
+from ..bloomberg.data_fetcher import MarketDataFetcher, MarketData
 from ..models.garman_kohlhagen import GarmanKohlhagen, OptionParams, Direction
 from ..calendars.fx_conventions import FXCalendarFactory
 from ..volatility.surface import VolSurface, VolSmile
-from ..rates.curves import RateCurve, FXRates, ImpliedDepoCalculator
+from ..rates.curves import RateCurve, FXRates, ForwardCurve
 from ..utils.date_utils import is_tenor, year_fraction, tenor_to_years
 
 logger = logging.getLogger(__name__)
@@ -39,7 +39,7 @@ class FXOptionPricer(QMainWindow):
         self._config: Optional[Config] = None
         self._market_data: Optional[MarketData] = None
         self._vol_surface: Optional[VolSurface] = None
-        self._usd_curve: Optional[RateCurve] = None
+        self._fx_rates: Optional[FXRates] = None
         self._bbg_connected: bool = False
 
         # Initialize
@@ -59,6 +59,9 @@ class FXOptionPricer(QMainWindow):
         except FileNotFoundError as e:
             logger.warning(f"Config file not found: {e}")
             self._config = Config()
+            # Set default tenors and pairs
+            self._config.tenors = ["1W", "2W", "1M", "2M", "3M", "6M", "9M", "1Y", "18M", "2Y"]
+            self._config.currency_pairs = ["EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCAD", "USDCHF", "EURGBP", "AUDNZD"]
 
     def _setup_ui(self) -> None:
         """Set up the user interface."""
@@ -200,8 +203,8 @@ class FXOptionPricer(QMainWindow):
         self.notional_ccy.addItems(["EUR", "USD"])
         self.notional_ccy.setFixedWidth(50)
         grid.addWidget(self.notional_ccy, row, 1)
-        self.notional_input = NumericInput(decimals=2)
-        self.notional_input.setText("1,000,000.00")
+        self.notional_input = NumericInput(decimals=0)
+        self.notional_input.setText("1,000,000")
         grid.addWidget(self.notional_input, row, 2)
         row += 1
 
@@ -215,7 +218,6 @@ class FXOptionPricer(QMainWindow):
 
     def _create_market_data_section(self, parent_layout: QVBoxLayout) -> None:
         """Create the market data section."""
-        # Section header
         header = SectionHeader("More Market Data")
         parent_layout.addWidget(header)
 
@@ -264,7 +266,7 @@ class FXOptionPricer(QMainWindow):
         grid.addWidget(self.forward_display, row, 2)
         row += 1
 
-        # EUR Depo (foreign rate)
+        # Foreign Depo (base currency rate)
         self.foreign_depo_label = QLabel("EUR Depo")
         grid.addWidget(self.foreign_depo_label, row, 0)
         self.foreign_depo_source = QComboBox()
@@ -276,10 +278,11 @@ class FXOptionPricer(QMainWindow):
         grid.addWidget(self.foreign_depo_display, row, 2)
         row += 1
 
-        # USD Depo (domestic rate)
-        grid.addWidget(QLabel("USD Depo"), row, 0)
+        # Domestic Depo (quote currency rate)
+        self.domestic_depo_label = QLabel("USD Depo")
+        grid.addWidget(self.domestic_depo_label, row, 0)
         self.domestic_depo_source = QComboBox()
-        self.domestic_depo_source.addItems(["USD SOFR", "USD FF"])
+        self.domestic_depo_source.addItems(["Implied", "USD SOFR"])
         self.domestic_depo_source.setFixedWidth(70)
         grid.addWidget(self.domestic_depo_source, row, 1)
         self.domestic_depo_display = QLineEdit()
@@ -391,13 +394,8 @@ class FXOptionPricer(QMainWindow):
 
     def _connect_signals(self) -> None:
         """Connect widget signals to slots."""
-        # Asset change
         self.asset_combo.currentTextChanged.connect(self._on_asset_changed)
-
-        # Expiry change
         self.expiry_input.textChanged.connect(self._on_expiry_changed)
-
-        # Auto-calculate on key changes
         self.spot_input.valueChanged.connect(self._on_input_changed)
         self.strike_input.valueChanged.connect(self._on_input_changed)
         self.call_put_combo.currentTextChanged.connect(self._on_input_changed)
@@ -408,25 +406,20 @@ class FXOptionPricer(QMainWindow):
         if not self._config:
             return
 
-        # Set default asset
         idx = self.asset_combo.findText(self._config.default_asset)
         if idx >= 0:
             self.asset_combo.setCurrentIndex(idx)
 
-        # Set default notional
-        self.notional_input.set_value(self._config.default_notional)
+        self.notional_input.set_value(self._config.default_notional, use_thousands_sep=True)
 
-        # Set default call/put
         idx = self.call_put_combo.findText(self._config.default_call_put)
         if idx >= 0:
             self.call_put_combo.setCurrentIndex(idx)
 
-        # Set default direction
         idx = self.direction_combo.findText(self._config.default_direction)
         if idx >= 0:
             self.direction_combo.setCurrentIndex(idx)
 
-        # Trigger asset changed to update labels
         self._on_asset_changed(self.asset_combo.currentText())
 
     def _try_connect_bloomberg(self) -> None:
@@ -440,64 +433,106 @@ class FXOptionPricer(QMainWindow):
                     self._load_market_data()
                 else:
                     self._bbg_connected = False
-                    self.statusBar().showMessage("Bloomberg connection failed - using mock data")
-                    self._load_mock_data()
+                    self.statusBar().showMessage("Bloomberg connection failed")
             else:
                 self._bbg_connected = False
-                self.statusBar().showMessage("Bloomberg API not available - using mock data")
-                self._load_mock_data()
+                self.statusBar().showMessage("Bloomberg API not available")
         except Exception as e:
             logger.error(f"Bloomberg connection error: {e}")
             self._bbg_connected = False
-            self.statusBar().showMessage(f"Error: {e} - using mock data")
-            self._load_mock_data()
+            self.statusBar().showMessage(f"Error: {e}")
 
     def _load_market_data(self) -> None:
         """Load market data from Bloomberg."""
-        if not self._config:
+        if not self._config or not self._bbg_connected:
             return
 
         ccy_pair = self.asset_combo.currentText()
         tenors = self._config.tenors
+        today = date.today()
 
         try:
+            # Calculate days to maturity for each tenor
+            days_to_maturity = {}
+            for tenor in tenors:
+                try:
+                    expiry = FXCalendarFactory.get_expiry_from_tenor(ccy_pair, today, tenor)
+                    days_to_maturity[tenor] = (expiry - today).days
+                except Exception as e:
+                    logger.warning(f"Could not calculate days for {tenor}: {e}")
+
+            logger.info(f"=== LOADING MARKET DATA FOR {ccy_pair} ===")
+            logger.info(f"Tenors: {tenors}")
+            logger.info(f"Days to maturity: {days_to_maturity}")
+
             conn = BloombergConnection.get_instance()
             fetcher = MarketDataFetcher(conn)
-            self._market_data = fetcher.fetch_all(
-                ccy_pair, tenors, self._config.usd_curve_ticker_prefix
-            )
+            self._market_data = fetcher.fetch_all(ccy_pair, tenors, days_to_maturity)
+
+            logger.info(f"=== MARKET DATA RECEIVED ===")
+            logger.info(f"Spot: {self._market_data.spot}")
+            logger.info(f"Forward points: {self._market_data.forward_points}")
+            logger.info(f"Forward rates: {self._market_data.forward_rates}")
+            logger.info(f"USD rates: {self._market_data.usd_rates}")
+            logger.info(f"Domestic rates: {self._market_data.domestic_rates}")
+            logger.info(f"Foreign rates: {self._market_data.foreign_rates}")
+
+            # Build FX rates with cubic spline interpolation
+            self._fx_rates = FXRates.from_market_data(self._market_data)
+
+            logger.info(f"=== FX RATES BUILT ===")
+            logger.info(f"Domestic curve rates: {self._fx_rates.domestic_curve.rates}")
+            logger.info(f"Foreign curve rates: {self._fx_rates.foreign_curve.rates}")
+
+            # Build vol surface
+            self._build_vol_surface()
+
             self._update_market_data_display()
             self.statusBar().showMessage(f"Market data loaded for {ccy_pair}")
-        except Exception as e:
-            logger.error(f"Failed to load market data: {e}")
-            self.statusBar().showMessage(f"Data load failed: {e}")
-            self._load_mock_data()
 
-    def _load_mock_data(self) -> None:
-        """Load mock market data for testing."""
-        if not self._config:
+        except Exception as e:
+            logger.error(f"Failed to load market data: {e}", exc_info=True)
+            self.statusBar().showMessage(f"Data load failed: {e}")
+
+    def _build_vol_surface(self) -> None:
+        """Build volatility surface from market data."""
+        if not self._market_data:
             return
 
-        ccy_pair = self.asset_combo.currentText()
-        tenors = self._config.tenors
+        self._vol_surface = VolSurface()
+        today = date.today()
 
-        fetcher = MockMarketDataFetcher()
-        self._market_data = fetcher.fetch_all(ccy_pair, tenors)
-        self._update_market_data_display()
+        for tenor, smile_data in self._market_data.vol_smiles.items():
+            days = self._market_data.days_to_maturity.get(tenor, 30)
+            expiry_date = today + timedelta(days=days)
+            t = days / 365.0
+
+            smile = VolSmile(
+                tenor=tenor,
+                expiry_date=expiry_date,
+                time_to_expiry=t,
+                days_to_expiry=days,
+                vol_10p=smile_data.vol_10p,
+                vol_25p=smile_data.vol_25p,
+                vol_atm=smile_data.atm,
+                vol_25c=smile_data.vol_25c,
+                vol_10c=smile_data.vol_10c,
+            )
+
+            # Calculate strikes using interpolated rates
+            r_dom = self._fx_rates.get_domestic_rate(t) if self._fx_rates else 0.05
+            r_for = self._fx_rates.get_foreign_rate(t) if self._fx_rates else 0.03
+            smile.calculate_strikes(self._market_data.spot, r_dom, r_for)
+
+            self._vol_surface.add_smile(smile)
 
     def _update_market_data_display(self) -> None:
         """Update the market data display fields."""
         if not self._market_data:
             return
 
-        # Update spot
         self.spot_input.set_value(self._market_data.spot)
 
-        # Build USD curve
-        self._usd_curve = RateCurve(currency="USD")
-        self._usd_curve.set_rates(self._market_data.usd_rates)
-
-        # Update description
         ccy_pair = self._market_data.ccy_pair
         self.ts_description.setText(f"{ccy_pair[:3]}/{ccy_pair[3:]} Vanilla")
 
@@ -510,31 +545,28 @@ class FXOptionPricer(QMainWindow):
         base_ccy = ccy_pair[:3]
         quote_ccy = ccy_pair[3:]
 
-        # Update labels
         self.base_ccy_label.setText(base_ccy)
         self.foreign_depo_label.setText(f"{base_ccy} Depo")
+        self.domestic_depo_label.setText(f"{quote_ccy} Depo")
 
-        # Update notional currency options
         self.notional_ccy.clear()
         self.notional_ccy.addItems([base_ccy, quote_ccy])
 
-        # Update gamma currency options
         self.gamma_ccy.clear()
         self.gamma_ccy.addItems([base_ccy, quote_ccy])
 
-        # Update premium currency options
         self.premium_ccy.clear()
         self.premium_ccy.addItems([base_ccy, quote_ccy])
 
-        # Update price format options
         self.price_format.clear()
         self.price_format.addItems([f"% {base_ccy}", f"% {quote_ccy}", "Pips"])
 
-        # Reload market data
+        # Reset surfaces
+        self._vol_surface = None
+        self._fx_rates = None
+
         if self._bbg_connected:
             self._load_market_data()
-        else:
-            self._load_mock_data()
 
     def _on_expiry_changed(self, text: str) -> None:
         """Handle expiry input change."""
@@ -547,14 +579,12 @@ class FXOptionPricer(QMainWindow):
 
         try:
             if is_tenor(text):
-                # Calculate expiry from tenor
                 expiry = FXCalendarFactory.get_expiry_from_tenor(ccy_pair, today, text)
                 delivery = FXCalendarFactory.get_delivery_from_expiry(ccy_pair, expiry)
 
                 self.expiry_date_display.setText(expiry.strftime("%m/%d/%y"))
                 self.delivery_date_display.setText(delivery.strftime("%m/%d/%y"))
             else:
-                # Try to parse as date
                 from ..utils.date_utils import parse_date_or_tenor
                 result = parse_date_or_tenor(text)
                 if isinstance(result, date):
@@ -569,8 +599,7 @@ class FXOptionPricer(QMainWindow):
             self.delivery_date_display.setText("")
 
     def _on_input_changed(self) -> None:
-        """Handle input field changes - trigger recalculation."""
-        # Could auto-calculate here, but let's wait for explicit calculate button
+        """Handle input field changes."""
         pass
 
     def _on_calculate(self) -> None:
@@ -584,16 +613,14 @@ class FXOptionPricer(QMainWindow):
     def _calculate(self) -> None:
         """Execute the pricing calculation."""
         if not self._market_data:
-            raise ValueError("No market data available")
+            raise ValueError("No market data available. Connect to Bloomberg first.")
 
-        # Get inputs
         ccy_pair = self.asset_combo.currentText().replace("/", "")
         spot = self.spot_input.get_value()
         strike = self.strike_input.get_value()
         notional = self.notional_input.get_value()
         is_call = self.call_put_combo.currentText() == "Call"
 
-        # Get expiry date
         expiry_text = self.expiry_date_display.text()
         if not expiry_text:
             raise ValueError("Please enter an expiry date or tenor")
@@ -606,23 +633,31 @@ class FXOptionPricer(QMainWindow):
         if time_to_expiry <= 0:
             raise ValueError("Expiry must be in the future")
 
-        # Get interpolated rates
-        usd_rate = self._usd_curve.get_rate(time_to_expiry) if self._usd_curve else 0.05
+        # Get interpolated rates using cubic spline
+        if self._fx_rates:
+            r_dom = self._fx_rates.get_domestic_rate(time_to_expiry)
+            r_for = self._fx_rates.get_foreign_rate(time_to_expiry)
+            forward = self._fx_rates.get_forward(time_to_expiry)
+        else:
+            r_dom = 0.05
+            r_for = 0.03
+            forward = spot * (1 + (r_dom - r_for) * time_to_expiry)
 
-        # Get forward points for interpolation
-        fwd_points = self._get_interpolated_forward_points(time_to_expiry)
+        logger.info(f"=== CALCULATION ===")
+        logger.info(f"Spot: {spot}, Strike: {strike}, Time: {time_to_expiry:.4f}")
+        logger.info(f"r_dom: {r_dom:.6f}, r_for: {r_for:.6f}")
+        logger.info(f"Forward: {forward:.5f}")
 
-        # Calculate FX rates
-        fx_rates = FXRates.calculate(
-            ccy_pair, spot, fwd_points, usd_rate, time_to_expiry
-        )
+        # Get forward points for display
+        fwd_points = (forward - spot) * 10000  # Convert to pips
 
         # Get interpolated volatility
-        vol = self._get_interpolated_vol(strike, time_to_expiry, spot, fx_rates.domestic_rate, fx_rates.foreign_rate)
+        vol = self._get_interpolated_vol(strike, time_to_expiry, spot, r_dom, r_for)
+        logger.info(f"Vol: {vol:.4f}")
 
         # If strike is 0 or not set, use ATMF
         if strike <= 0:
-            strike = fx_rates.forward_rate
+            strike = forward
             self.strike_input.set_value(strike)
             self.strike_label.setText("ATMF")
         else:
@@ -635,8 +670,8 @@ class FXOptionPricer(QMainWindow):
         params = OptionParams(
             spot=spot,
             strike=strike,
-            domestic_rate=fx_rates.domestic_rate,
-            foreign_rate=fx_rates.foreign_rate,
+            domestic_rate=r_dom,
+            foreign_rate=r_for,
             volatility=vol,
             time_to_expiry=time_to_expiry,
             is_call=is_call,
@@ -644,36 +679,19 @@ class FXOptionPricer(QMainWindow):
             notional_currency="FOR" if notional_ccy == base_ccy else "DOM"
         )
 
-        # Calculate
         result = GarmanKohlhagen.calculate_all(params)
 
-        # Get direction
+        logger.info(f"Premium (domestic): {result.premium:.2f}")
+        logger.info(f"Premium %: {result.premium_pct:.4f}")
+        logger.info(f"Delta: {result.greeks.delta:.4f}")
+        logger.info(f"Gamma: {result.greeks.gamma:.8f}")
+
         direction_text = self.direction_combo.currentText()
         direction = Direction.CLIENT_BUYS if "buys" in direction_text.lower() else Direction.CLIENT_SELLS
 
-        # Calculate hedge
         hedge = GarmanKohlhagen.calculate_delta_hedge(params, direction)
 
-        # Update displays
-        self._update_results_display(result, fx_rates, vol, fwd_points, hedge, params)
-
-    def _get_interpolated_forward_points(self, time_to_expiry: float) -> float:
-        """Get interpolated forward points for the given time."""
-        if not self._market_data or not self._market_data.forward_points:
-            return 0.0
-
-        from ..models.interpolation import linear_interpolate
-
-        tenors = list(self._market_data.forward_points.keys())
-        points = list(self._market_data.forward_points.values())
-        times = [tenor_to_years(t) for t in tenors]
-
-        # Sort by time
-        sorted_data = sorted(zip(times, points))
-        times = [d[0] for d in sorted_data]
-        points = [d[1] for d in sorted_data]
-
-        return linear_interpolate(time_to_expiry, times, points)
+        self._update_results_display(result, r_dom, r_for, forward, vol, fwd_points, hedge, params)
 
     def _get_interpolated_vol(
         self,
@@ -684,81 +702,116 @@ class FXOptionPricer(QMainWindow):
         r_for: float
     ) -> float:
         """Get interpolated volatility for strike and expiry."""
-        if not self._market_data or not self._market_data.vol_smiles:
-            return 0.08  # Default 8%
+        # Default volatility if no surface available
+        DEFAULT_VOL = 0.10  # 10%
 
-        # Build vol surface if not already built
-        if self._vol_surface is None:
-            from ..volatility.surface import VolSurface, VolSmile
+        if not self._vol_surface:
+            return DEFAULT_VOL
 
-            self._vol_surface = VolSurface()
-            today = date.today()
+        # Check if surface has valid smiles
+        if len(self._vol_surface.tenors) == 0:
+            return DEFAULT_VOL
 
-            for tenor, smile_data in self._market_data.vol_smiles.items():
-                t = tenor_to_years(tenor)
-                from datetime import timedelta
-                expiry_date = today + timedelta(days=int(t * 365))
+        try:
+            if strike <= 0:
+                vol = self._vol_surface.get_atm_vol(time_to_expiry)
+            else:
+                vol = self._vol_surface.get_vol(strike, time_to_expiry, spot, r_dom, r_for)
 
-                smile = VolSmile(
-                    tenor=tenor,
-                    expiry_date=expiry_date,
-                    time_to_expiry=t,
-                    vol_10p=smile_data.vol_10p,
-                    vol_25p=smile_data.vol_25p,
-                    vol_atm=smile_data.atm,
-                    vol_25c=smile_data.vol_25c,
-                    vol_10c=smile_data.vol_10c,
-                )
-                smile.calculate_strikes(spot, r_dom, r_for)
-                self._vol_surface.add_smile(smile)
+            # Sanity check: vol should be between 0.01 (1%) and 2.0 (200%)
+            if vol < 0.01 or vol > 2.0:
+                logger.warning(f"Volatility {vol} out of range, using default")
+                return DEFAULT_VOL
 
-        # If strike is 0, use ATM
-        if strike <= 0:
-            return self._vol_surface.get_atm_vol(time_to_expiry)
+            return vol
 
-        return self._vol_surface.get_vol(strike, time_to_expiry, spot, r_dom, r_for)
+        except Exception as e:
+            logger.warning(f"Error interpolating volatility: {e}, using default")
+            return DEFAULT_VOL
 
     def _update_results_display(
         self,
         result,
-        fx_rates: FXRates,
+        r_dom: float,
+        r_for: float,
+        forward: float,
         vol: float,
         fwd_points: float,
         hedge: float,
         params: OptionParams
     ) -> None:
         """Update the results display fields."""
-        # Market data
+        ccy_pair = self.asset_combo.currentText().replace("/", "")
+        base_ccy = ccy_pair[:3]  # Foreign (e.g., EUR)
+        quote_ccy = ccy_pair[3:]  # Domestic (e.g., USD)
+
         self.vol_display.setText(f"{vol * 100:.3f}%")
         self.points_display.setText(f"{fwd_points:.2f}")
-        self.forward_display.setText(f"{fx_rates.forward_rate:.5f}")
-        self.foreign_depo_display.setText(f"{fx_rates.foreign_rate * 100:.3f}%")
-        self.domestic_depo_display.setText(f"{fx_rates.domestic_rate * 100:.3f}%")
+        self.forward_display.setText(f"{forward:.5f}")
+        self.foreign_depo_display.setText(f"{r_for * 100:.3f}%")
+        self.domestic_depo_display.setText(f"{r_dom * 100:.3f}%")
 
-        # Greeks
-        gamma_value = result.greeks.gamma * params.notional
-        self.gamma_display.setText(f"{gamma_value:,.2f}")
+        # Gamma: Bloomberg convention is gamma cash per 1% spot move
+        gamma_1pct = result.greeks.gamma * params.spot * 0.01 * params.notional
+        self.gamma_display.setText(f"{gamma_1pct:,.2f}")
+
+        # Vega: per 1% vol move
         vega_value = result.greeks.vega * params.notional
         self.vega_display.setText(f"{vega_value:,.2f}")
 
-        # Results
-        self.price_display.setText(f"{result.premium_pct:.4f}%")
-        self.premium_display.setText(f"{result.premium:,.2f}")
+        # result.premium is in DOMESTIC currency (USD for EURUSD)
+        # Convert to selected currency
+        premium_ccy = self.premium_ccy.currentText()
+        if premium_ccy == quote_ccy:
+            # Already in domestic (USD)
+            premium_display = result.premium
+        else:
+            # Convert to foreign (EUR): divide by spot
+            premium_display = result.premium / params.spot
+
+        # Price % - need to be consistent with premium currency
+        # result.premium_pct is % of foreign notional in domestic terms
+        # If notional is in EUR and we want % EUR: premium_in_eur / notional_eur * 100
+        price_format = self.price_format.currentText()
+        if f"% {base_ccy}" in price_format:
+            # % of foreign (EUR)
+            premium_in_for = result.premium / params.spot
+            if params.notional_currency == "FOR":
+                price_pct = premium_in_for / params.notional * 100
+            else:
+                price_pct = premium_in_for / (params.notional / params.spot) * 100
+        elif f"% {quote_ccy}" in price_format:
+            # % of domestic (USD)
+            if params.notional_currency == "FOR":
+                notional_dom = params.notional * params.spot
+            else:
+                notional_dom = params.notional
+            price_pct = result.premium / notional_dom * 100
+        else:
+            # Pips
+            price_pct = result.premium_pips
+
+        self.price_display.setText(f"{price_pct:.4f}%")
+        self.premium_display.setText(f"{premium_display:,.2f}")
         self.prem_date_display.setText(date.today().strftime("%m/%d/%y"))
         self.delta_display.setText(f"{result.greeks.delta * 100:.4f}%")
         self.hedge_display.setText(f"{hedge:,.2f}")
 
     def _on_refresh_data(self) -> None:
         """Refresh market data from Bloomberg."""
-        self._vol_surface = None  # Reset cached surface
+        self._vol_surface = None
+        self._fx_rates = None
         if self._bbg_connected:
             self._load_market_data()
         else:
-            self._load_mock_data()
+            QMessageBox.warning(
+                self,
+                "No Connection",
+                "Bloomberg is not connected. Please connect to Bloomberg first."
+            )
 
     def closeEvent(self, event) -> None:
         """Handle window close."""
-        # Disconnect Bloomberg if connected
         if self._bbg_connected:
             try:
                 BloombergConnection.get_instance().disconnect()

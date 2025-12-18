@@ -209,7 +209,6 @@ def year_fraction(start_date: date, end_date: date, day_count: str = "ACT/365") 
     elif day_count == "ACT/360":
         return days / 360.0
     elif day_count == "30/360":
-        # Simplified 30/360
         d1 = min(start_date.day, 30)
         d2 = min(end_date.day, 30) if d1 == 30 else end_date.day
         return (

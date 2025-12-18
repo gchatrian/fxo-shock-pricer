@@ -1,9 +1,13 @@
 """
-Linear interpolation utilities for rates and volatilities.
+Interpolation utilities for rates and volatilities.
+Supports linear, variance, and 2D interpolation.
 """
 
 from typing import List, Tuple, Optional
 import bisect
+
+import numpy as np
+from scipy.interpolate import CubicSpline, LinearNDInterpolator
 
 
 def linear_interpolate(
@@ -23,9 +27,6 @@ def linear_interpolate(
 
     Returns:
         Interpolated (or extrapolated) y value
-
-    Raises:
-        ValueError: If x_points and y_points have different lengths or are empty
     """
     if len(x_points) != len(y_points):
         raise ValueError("x_points and y_points must have the same length")
@@ -36,20 +37,16 @@ def linear_interpolate(
     if len(x_points) == 1:
         return y_points[0]
 
-    # Find position using binary search
     idx = bisect.bisect_left(x_points, x)
 
-    # Handle boundaries
     if idx == 0:
         if extrapolate:
-            # Extrapolate using first two points
             return _linear_segment(x, x_points[0], y_points[0], x_points[1], y_points[1])
         else:
             return y_points[0]
 
     if idx >= len(x_points):
         if extrapolate:
-            # Extrapolate using last two points
             return _linear_segment(
                 x,
                 x_points[-2], y_points[-2],
@@ -58,7 +55,6 @@ def linear_interpolate(
         else:
             return y_points[-1]
 
-    # Interpolate between idx-1 and idx
     return _linear_segment(
         x,
         x_points[idx - 1], y_points[idx - 1],
@@ -67,22 +63,52 @@ def linear_interpolate(
 
 
 def _linear_segment(x: float, x1: float, y1: float, x2: float, y2: float) -> float:
+    """Calculate y value on a line segment."""
+    if x2 == x1:
+        return y1
+    slope = (y2 - y1) / (x2 - x1)
+    return y1 + slope * (x - x1)
+
+
+def cubic_spline_interpolate(
+    x: float,
+    x_points: List[float],
+    y_points: List[float],
+    extrapolate: bool = True
+) -> float:
     """
-    Calculate y value on a line segment.
+    Perform cubic spline interpolation.
 
     Args:
         x: Target x value
-        x1, y1: First point
-        x2, y2: Second point
+        x_points: List of known x values (must be sorted ascending)
+        y_points: List of corresponding y values
+        extrapolate: If True, extrapolate beyond the range (flat)
 
     Returns:
-        y value at x
+        Interpolated y value
     """
-    if x2 == x1:
-        return y1
+    if len(x_points) != len(y_points):
+        raise ValueError("x_points and y_points must have the same length")
 
-    slope = (y2 - y1) / (x2 - x1)
-    return y1 + slope * (x - x1)
+    if len(x_points) == 0:
+        raise ValueError("Cannot interpolate with empty points")
+
+    if len(x_points) == 1:
+        return y_points[0]
+
+    if len(x_points) == 2:
+        return linear_interpolate(x, x_points, y_points, extrapolate)
+
+    spline = CubicSpline(x_points, y_points, bc_type='natural')
+
+    if not extrapolate:
+        if x < x_points[0]:
+            return y_points[0]
+        if x > x_points[-1]:
+            return y_points[-1]
+
+    return float(spline(x))
 
 
 def variance_interpolate(
@@ -135,16 +161,7 @@ def find_bracketing_indices(
     x: float,
     x_points: List[float]
 ) -> Tuple[int, int]:
-    """
-    Find indices of points that bracket the target value.
-
-    Args:
-        x: Target value
-        x_points: Sorted list of points
-
-    Returns:
-        Tuple of (lower_index, upper_index)
-    """
+    """Find indices of points that bracket the target value."""
     if len(x_points) == 0:
         raise ValueError("Cannot find brackets in empty list")
 
@@ -177,7 +194,7 @@ def interpolate_2d(
         y: Target y value
         x_points: List of x grid points
         y_points: List of y grid points
-        z_matrix: 2D matrix of z values, z_matrix[i][j] corresponds to (x_points[i], y_points[j])
+        z_matrix: 2D matrix of z values
         extrapolate: If True, extrapolate beyond the grid
 
     Returns:
@@ -186,11 +203,81 @@ def interpolate_2d(
     if len(x_points) == 0 or len(y_points) == 0:
         raise ValueError("Cannot interpolate with empty points")
 
-    # First interpolate along x dimension for each y slice
     z_at_x = []
     for j in range(len(y_points)):
         z_slice = [z_matrix[i][j] for i in range(len(x_points))]
         z_at_x.append(linear_interpolate(x, x_points, z_slice, extrapolate))
 
-    # Then interpolate along y dimension
     return linear_interpolate(y, y_points, z_at_x, extrapolate)
+
+
+def interpolate_volatility_surface(
+    maturity: float,
+    strike: float,
+    maturities_in_days: List[int],
+    strikes_mapping: dict,
+    volatilities: dict
+) -> float:
+    """
+    Interpolate volatility from a surface using LinearNDInterpolator.
+
+    Args:
+        maturity: Target maturity in days
+        strike: Target strike
+        maturities_in_days: List of available maturities
+        strikes_mapping: Dict mapping maturity -> list of strikes
+        volatilities: Dict mapping maturity -> list of volatilities
+
+    Returns:
+        Interpolated volatility
+    """
+    points = []
+    values = []
+
+    for mat in maturities_in_days:
+        for i, s in enumerate(strikes_mapping[mat]):
+            points.append([mat, s])
+            values.append(volatilities[mat][i])
+
+    points = np.array(points)
+    values = np.array(values)
+
+    interpolator = LinearNDInterpolator(points, values)
+    interpolated_value = interpolator(maturity, strike)
+
+    if np.isnan(interpolated_value):
+        interpolated_value = _extrapolate_volatility(
+            maturity, strike, maturities_in_days, strikes_mapping, volatilities
+        )
+
+    return round(float(interpolated_value), 4)
+
+
+def _extrapolate_volatility(
+    maturity: float,
+    strike: float,
+    maturities_in_days: List[int],
+    strikes_mapping: dict,
+    volatilities: dict
+) -> float:
+    """Extrapolate volatility when outside the interpolation bounds."""
+    maturities = sorted(maturities_in_days)
+
+    if maturity < maturities[0]:
+        nearest_maturity = maturities[0]
+    elif maturity > maturities[-1]:
+        nearest_maturity = maturities[-1]
+    else:
+        nearest_maturity = min(maturities, key=lambda x: abs(x - maturity))
+
+    strikes = sorted(strikes_mapping[nearest_maturity])
+
+    if strike < strikes[0]:
+        nearest_strike = strikes[0]
+    elif strike > strikes[-1]:
+        nearest_strike = strikes[-1]
+    else:
+        nearest_strike = min(strikes, key=lambda x: abs(x - strike))
+
+    strike_index = strikes_mapping[nearest_maturity].index(nearest_strike)
+    return volatilities[nearest_maturity][strike_index]
