@@ -640,7 +640,7 @@ class HistoricalDataFetcher:
             target_date: Target date for data
 
         Returns:
-            Dictionary with spot, forward_points, atm_vols, usd_rates
+            Dictionary with spot, forward_points, vol_smiles (full surface), usd_rates
         """
         ccy_pair = ccy_pair.upper().replace("/", "")
 
@@ -658,12 +658,11 @@ class HistoricalDataFetcher:
             fwd_tickers[tenor] = ticker
             all_tickers.append(ticker)
 
-        # ATM vols
+        # Full volatility surface: ATM + RR25 + BF25 + RR10 + BF10
         vol_tickers = {}
         for tenor in tenors:
-            ticker = TickerBuilder.vol_atm_ticker(ccy_pair, tenor)
-            vol_tickers[tenor] = ticker
-            all_tickers.append(ticker)
+            vol_tickers[tenor] = TickerBuilder.get_all_vol_tickers(ccy_pair, tenor)
+            all_tickers.extend(vol_tickers[tenor].values())
 
         # USD rates
         usd_tickers = TickerBuilder.get_usd_curve_tickers(tenors, "BGN")
@@ -677,7 +676,7 @@ class HistoricalDataFetcher:
         result = {
             'spot': 0.0,
             'forward_points': {},
-            'atm_vols': {},
+            'vol_smiles': {},  # Full surface: tenor -> {atm, rr25, bf25, rr10, bf10}
             'usd_rates': {},
             'date': target_date
         }
@@ -693,11 +692,20 @@ class HistoricalDataFetcher:
                 for dt, val in raw_data[ticker].items():
                     result['forward_points'][tenor] = val
 
-        # Get ATM vols
-        for tenor, ticker in vol_tickers.items():
-            if ticker in raw_data:
-                for dt, val in raw_data[ticker].items():
-                    result['atm_vols'][tenor] = val
+        # Get full vol surface
+        for tenor, tickers in vol_tickers.items():
+            smile_data = {}
+            for vol_type, ticker in tickers.items():
+                if ticker in raw_data:
+                    for dt, val in raw_data[ticker].items():
+                        # vol_type is 'ATM', 'RR25', 'BF25', 'RR10', 'BF10'
+                        smile_data[vol_type.lower()] = val
+            
+            if smile_data:
+                result['vol_smiles'][tenor] = smile_data
+                logger.info(f"  Vol {tenor}: ATM={smile_data.get('atm', 0):.2f}%, "
+                           f"RR25={smile_data.get('rr25', 0):.2f}, "
+                           f"BF25={smile_data.get('bf25', 0):.2f}")
 
         # Get USD rates
         for tenor, ticker in usd_tickers.items():
@@ -708,7 +716,7 @@ class HistoricalDataFetcher:
         logger.info(f"Historical data for {ccy_pair} on {target_date}:")
         logger.info(f"  Spot: {result['spot']}")
         logger.info(f"  Forward points: {result['forward_points']}")
-        logger.info(f"  ATM vols: {result['atm_vols']}")
+        logger.info(f"  Vol smiles: {len(result['vol_smiles'])} tenors with full surface")
         logger.info(f"  USD rates: {result['usd_rates']}")
 
         return result
@@ -733,8 +741,15 @@ class MarketDataDelta:
     # Interest rates: absolute difference (end - start) per tenor
     usd_rate_diffs: Dict[str, float] = field(default_factory=dict)
     
-    # ATM volatility: absolute difference (end - start) per tenor
+    # Volatility surface: absolute differences (end - start) per tenor
+    # ATM volatility
     atm_vol_diffs: Dict[str, float] = field(default_factory=dict)
+    # Risk reversals (25D and 10D)
+    rr25_diffs: Dict[str, float] = field(default_factory=dict)
+    rr10_diffs: Dict[str, float] = field(default_factory=dict)
+    # Butterflies (25D and 10D)
+    bf25_diffs: Dict[str, float] = field(default_factory=dict)
+    bf10_diffs: Dict[str, float] = field(default_factory=dict)
     
     @classmethod
     def calculate(
@@ -792,14 +807,51 @@ class MarketDataDelta:
             rate_diffs[tenor] = diff / 100.0  # Convert from bps to decimal
             logger.info(f"  USD Rate {tenor}: {start_rate:.3f}% -> {end_rate:.3f}% ({diff:+.3f}%)")
         
-        # ATM vol differences (absolute)
-        vol_diffs = {}
-        for tenor in start_data.get('atm_vols', {}).keys():
-            start_vol = start_data['atm_vols'].get(tenor, 0)
-            end_vol = end_data.get('atm_vols', {}).get(tenor, 0)
-            diff = end_vol - start_vol
-            vol_diffs[tenor] = diff / 100.0  # Convert from % to decimal
-            logger.info(f"  ATM Vol {tenor}: {start_vol:.2f}% -> {end_vol:.2f}% ({diff:+.2f}%)")
+        # Volatility surface differences (ATM + RR + BF)
+        atm_diffs = {}
+        rr25_diffs = {}
+        rr10_diffs = {}
+        bf25_diffs = {}
+        bf10_diffs = {}
+        
+        logger.info(f"  === Volatility Surface Diffs ===")
+        for tenor in start_data.get('vol_smiles', {}).keys():
+            start_smile = start_data['vol_smiles'].get(tenor, {})
+            end_smile = end_data.get('vol_smiles', {}).get(tenor, {})
+            
+            if start_smile and end_smile:
+                # ATM
+                start_atm = start_smile.get('atm', 0)
+                end_atm = end_smile.get('atm', 0)
+                atm_diff = (end_atm - start_atm) / 100.0  # Convert from % to decimal
+                atm_diffs[tenor] = atm_diff
+                
+                # RR25
+                start_rr25 = start_smile.get('rr25', 0)
+                end_rr25 = end_smile.get('rr25', 0)
+                rr25_diff = (end_rr25 - start_rr25) / 100.0
+                rr25_diffs[tenor] = rr25_diff
+                
+                # RR10
+                start_rr10 = start_smile.get('rr10', 0)
+                end_rr10 = end_smile.get('rr10', 0)
+                rr10_diff = (end_rr10 - start_rr10) / 100.0
+                rr10_diffs[tenor] = rr10_diff
+                
+                # BF25
+                start_bf25 = start_smile.get('bf25', 0)
+                end_bf25 = end_smile.get('bf25', 0)
+                bf25_diff = (end_bf25 - start_bf25) / 100.0
+                bf25_diffs[tenor] = bf25_diff
+                
+                # BF10
+                start_bf10 = start_smile.get('bf10', 0)
+                end_bf10 = end_smile.get('bf10', 0)
+                bf10_diff = (end_bf10 - start_bf10) / 100.0
+                bf10_diffs[tenor] = bf10_diff
+                
+                logger.info(f"  {tenor}: ATM {start_atm:.2f}%->{end_atm:.2f}% ({atm_diff*100:+.3f}%), "
+                           f"RR25 {start_rr25:.2f}->{end_rr25:.2f}, BF25 {start_bf25:.2f}->{end_bf25:.2f}")
         
         logger.info(f"=== DELTA CALCULATION COMPLETE ===")
         
@@ -810,7 +862,11 @@ class MarketDataDelta:
             spot_pct_change=spot_pct,
             forward_pct_changes=fwd_pct_changes,
             usd_rate_diffs=rate_diffs,
-            atm_vol_diffs=vol_diffs
+            atm_vol_diffs=atm_diffs,
+            rr25_diffs=rr25_diffs,
+            rr10_diffs=rr10_diffs,
+            bf25_diffs=bf25_diffs,
+            bf10_diffs=bf10_diffs
         )
 
 
@@ -823,14 +879,20 @@ class ShockedMarketData:
     forward_rates: Dict[str, float]
     domestic_rates: Dict[str, float]
     foreign_rates: Dict[str, float]
-    atm_vols: Dict[str, float]
-    shocked_expiry_days: int
-    original_expiry_days: int
+    
+    # Complete vol surface (per tenor): each is a dict with atm, rr25, rr10, bf25, bf10
+    vol_smiles: Dict[str, Dict[str, float]] = field(default_factory=dict)
+    
+    # Legacy: ATM vols only (for backward compatibility)
+    atm_vols: Dict[str, float] = field(default_factory=dict)
+    
+    shocked_expiry_days: int = 0
+    original_expiry_days: int = 0
     
     # Delta details for display
-    spot_shock_pct: float
-    vol_shock: float  # Average vol shock for display
-    rate_shock: float  # Average rate shock for display
+    spot_shock_pct: float = 0.0
+    vol_shock: float = 0.0  # Average ATM vol shock for display
+    rate_shock: float = 0.0  # Average rate shock for display
 
 
 class ShockCalculator:
@@ -891,17 +953,43 @@ class ShockCalculator:
             shocked_for_rates[tenor] = shocked_rate
             logger.info(f"  For Rate {tenor}: {rate:.4f} + {diff:.4f} = {shocked_rate:.4f}")
         
-        # 5. ATM vol shock (absolute difference)
-        shocked_vols = {}
+        # 5. Full volatility surface shock (ATM + RR + BF)
+        shocked_vol_smiles = {}
+        shocked_atm_vols = {}
         avg_vol_shock = 0.0
         vol_count = 0
+        
+        logger.info(f"  === Shocking Volatility Surface ===")
         for tenor, smile in current_market_data.vol_smiles.items():
-            diff = delta.atm_vol_diffs.get(tenor, 0)
-            shocked_vol = smile.atm + diff
-            shocked_vols[tenor] = max(0.001, shocked_vol)  # Floor at 0.1%
-            avg_vol_shock += diff
+            # Get diffs for this tenor
+            atm_diff = delta.atm_vol_diffs.get(tenor, 0)
+            rr25_diff = delta.rr25_diffs.get(tenor, 0)
+            rr10_diff = delta.rr10_diffs.get(tenor, 0)
+            bf25_diff = delta.bf25_diffs.get(tenor, 0)
+            bf10_diff = delta.bf10_diffs.get(tenor, 0)
+            
+            # Apply shocks
+            shocked_atm = max(0.001, smile.atm + atm_diff)
+            shocked_rr25 = smile.rr25 + rr25_diff
+            shocked_rr10 = smile.rr10 + rr10_diff
+            shocked_bf25 = max(0, smile.bf25 + bf25_diff)  # BF should be positive
+            shocked_bf10 = max(0, smile.bf10 + bf10_diff)
+            
+            shocked_vol_smiles[tenor] = {
+                'atm': shocked_atm,
+                'rr25': shocked_rr25,
+                'rr10': shocked_rr10,
+                'bf25': shocked_bf25,
+                'bf10': shocked_bf10
+            }
+            shocked_atm_vols[tenor] = shocked_atm
+            
+            avg_vol_shock += atm_diff
             vol_count += 1
-            logger.info(f"  Vol {tenor}: {smile.atm:.4f} + {diff:.4f} = {shocked_vol:.4f}")
+            
+            logger.info(f"  {tenor}: ATM {smile.atm:.4f}->{shocked_atm:.4f}, "
+                       f"RR25 {smile.rr25:.4f}->{shocked_rr25:.4f}, "
+                       f"BF25 {smile.bf25:.4f}->{shocked_bf25:.4f}")
         
         if vol_count > 0:
             avg_vol_shock /= vol_count
@@ -920,7 +1008,8 @@ class ShockCalculator:
             forward_rates=shocked_forwards,
             domestic_rates=shocked_dom_rates,
             foreign_rates=shocked_for_rates,
-            atm_vols=shocked_vols,
+            vol_smiles=shocked_vol_smiles,
+            atm_vols=shocked_atm_vols,
             shocked_expiry_days=shocked_expiry,
             original_expiry_days=original_expiry_days,
             spot_shock_pct=delta.spot_pct_change,

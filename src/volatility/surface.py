@@ -262,11 +262,12 @@ class VolSurface:
 
         Returns:
             Interpolated volatility (as decimal, e.g., 0.10 for 10%)
+            
+        Raises:
+            ValueError: If no smiles in surface or interpolation fails
         """
-        DEFAULT_VOL = 0.10
-
         if len(self._smiles) == 0:
-            return DEFAULT_VOL
+            raise ValueError("VOL SURFACE ERROR: No smiles in surface")
 
         # Calculate strikes if needed
         if spot is not None:
@@ -285,10 +286,11 @@ class VolSurface:
         if len(self._smiles) == 1:
             smile = list(self._smiles.values())[0]
             vol = smile.get_vol_for_strike(strike)
-            # Sanity check
-            if 0.001 < vol < 2.0:
-                return vol
-            return DEFAULT_VOL
+            if vol <= 0:
+                raise ValueError(f"VOL SURFACE ERROR: Single tenor interpolation returned vol <= 0 ({vol:.6f})")
+            if vol > 2.0:
+                raise ValueError(f"VOL SURFACE ERROR: Single tenor interpolation returned vol > 200% ({vol:.4f})")
+            return vol
 
         # Try 2D interpolation
         if self._nd_interpolator is not None:
@@ -296,23 +298,28 @@ class VolSurface:
                 vol = self._nd_interpolator(days, strike)
                 if not np.isnan(vol) and 0.001 < float(vol) < 2.0:
                     return round(float(vol), 4)
-            except Exception:
-                pass
+            except Exception as e:
+                # Log but continue to variance interpolation
+                import logging
+                logging.getLogger(__name__).debug(f"2D interpolation failed: {e}, trying variance interpolation")
 
-        # Fallback: variance interpolation
-        try:
-            vol = self._interpolate_with_variance(strike, time_to_expiry)
-            if 0.001 < vol < 2.0:
-                return vol
-        except Exception:
-            pass
-
-        return DEFAULT_VOL
+        # Try variance interpolation
+        vol = self._interpolate_with_variance(strike, time_to_expiry)
+        if vol <= 0:
+            raise ValueError(f"VOL SURFACE ERROR: Variance interpolation returned vol <= 0 ({vol:.6f})")
+        if vol > 2.0:
+            raise ValueError(f"VOL SURFACE ERROR: Variance interpolation returned vol > 200% ({vol:.4f})")
+        return vol
 
     def _interpolate_with_variance(self, strike: float, time_to_expiry: float) -> float:
-        """Interpolate using variance method for term structure."""
+        """
+        Interpolate using variance method for term structure.
+        
+        Raises:
+            ValueError: If no smiles available
+        """
         if len(self._smiles) == 0:
-            return 0.10
+            raise ValueError("VOL SURFACE ERROR: No smiles for variance interpolation")
 
         # Get bracketing tenors
         lower_idx = 0
@@ -351,42 +358,44 @@ class VolSurface:
 
         Returns:
             Interpolated ATM volatility (as decimal)
+            
+        Raises:
+            ValueError: If no smiles in surface or interpolation fails
         """
-        DEFAULT_VOL = 0.10
-
         if len(self._smiles) == 0:
-            return DEFAULT_VOL
+            raise ValueError("VOL SURFACE ERROR: No smiles in surface for ATM vol")
 
         if not self._atm_spline:
             self._build_cache()
 
         if self._atm_spline is None:
-            # Fallback to variance interpolation
+            # Use variance interpolation
             t_points = [t for _, t in self._tenor_times]
             vol_points = [self._smiles[tenor].vol_atm for tenor, _ in self._tenor_times]
 
-            # Check if vol_points are valid
-            if not vol_points or any(v <= 0 or v > 2.0 for v in vol_points):
-                return DEFAULT_VOL
+            # Validate vol_points
+            for i, (tenor, v) in enumerate(zip([t for t, _ in self._tenor_times], vol_points)):
+                if v <= 0:
+                    raise ValueError(f"VOL SURFACE ERROR: ATM vol for tenor {tenor} is <= 0 ({v:.6f})")
+                if v > 2.0:
+                    raise ValueError(f"VOL SURFACE ERROR: ATM vol for tenor {tenor} is > 200% ({v:.4f})")
 
-            try:
-                vol = variance_interpolate(time_to_expiry, t_points, vol_points, extrapolate=True)
-                if 0.001 < vol < 2.0:
-                    return vol
-            except Exception:
-                pass
-            return DEFAULT_VOL
+            vol = variance_interpolate(time_to_expiry, t_points, vol_points, extrapolate=True)
+            if vol <= 0:
+                raise ValueError(f"VOL SURFACE ERROR: ATM variance interpolation returned vol <= 0 ({vol:.6f})")
+            if vol > 2.0:
+                raise ValueError(f"VOL SURFACE ERROR: ATM variance interpolation returned vol > 200% ({vol:.4f})")
+            return vol
 
-        try:
-            days = int(time_to_expiry * 365)
-            days = max(self._maturities_in_days[0], min(days, self._maturities_in_days[-1]))
-            vol = float(self._atm_spline(days))
-            if 0.001 < vol < 2.0:
-                return vol
-        except Exception:
-            pass
-
-        return DEFAULT_VOL
+        days = int(time_to_expiry * 365)
+        days = max(self._maturities_in_days[0], min(days, self._maturities_in_days[-1]))
+        vol = float(self._atm_spline(days))
+        
+        if vol <= 0:
+            raise ValueError(f"VOL SURFACE ERROR: ATM spline returned vol <= 0 ({vol:.6f})")
+        if vol > 2.0:
+            raise ValueError(f"VOL SURFACE ERROR: ATM spline returned vol > 200% ({vol:.4f})")
+        return vol
 
     def get_smile_for_tenor(self, tenor: str) -> Optional[VolSmile]:
         """Get smile for a specific tenor."""

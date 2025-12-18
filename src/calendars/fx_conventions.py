@@ -15,21 +15,71 @@ class FXCalendarFactory:
     """Factory for creating combined FX calendars and calculating FX dates."""
 
     # Currency to QuantLib calendar mapping
-    CALENDARS: Dict[str, ql.Calendar] = {
-        "EUR": ql.TARGET(),
-        "USD": ql.UnitedStates(ql.UnitedStates.FederalReserve),
-        "GBP": ql.UnitedKingdom(ql.UnitedKingdom.Exchange),
-        "JPY": ql.Japan(),
-        "AUD": ql.Australia(),
-        "CAD": ql.Canada(),
-        "CHF": ql.Switzerland(),
-        "NZD": ql.NewZealand(),
-        "SEK": ql.Sweden(),
-        "NOK": ql.Norway(),
-        "DKK": ql.Denmark(),
-        "SGD": ql.Singapore(),
-        "HKD": ql.HongKong(),
-    }
+    # To add a new currency, add an entry here with the appropriate QuantLib calendar
+    # See QuantLib documentation for available calendars
+    # If a calendar doesn't exist in your QuantLib version, TARGET will be used as fallback
+    CALENDARS: Dict[str, ql.Calendar] = {}
+    
+    @classmethod
+    def _init_calendars(cls) -> None:
+        """Initialize calendars with fallback for unsupported ones."""
+        if cls.CALENDARS:
+            return  # Already initialized
+            
+        import logging
+        logger = logging.getLogger(__name__)
+        
+        # Define desired calendars - will use TARGET as fallback if not available
+        calendar_definitions = {
+            # G10 currencies
+            "EUR": lambda: ql.TARGET(),
+            "USD": lambda: ql.UnitedStates(ql.UnitedStates.FederalReserve),
+            "GBP": lambda: ql.UnitedKingdom(ql.UnitedKingdom.Exchange),
+            "JPY": lambda: ql.Japan(),
+            "AUD": lambda: ql.Australia(),
+            "CAD": lambda: ql.Canada(),
+            "CHF": lambda: ql.Switzerland(),
+            "NZD": lambda: ql.NewZealand(),
+            "SEK": lambda: ql.Sweden(),
+            "NOK": lambda: ql.Norway(),
+            
+            # European
+            "DKK": lambda: ql.Denmark(),
+            "PLN": lambda: ql.Poland(),
+            "CZK": lambda: ql.CzechRepublic(),
+            "HUF": lambda: ql.Hungary(),
+            "RON": lambda: ql.Romania(),
+            
+            # Asia Pacific
+            "SGD": lambda: ql.Singapore(),
+            "HKD": lambda: ql.HongKong(),
+            "CNY": lambda: ql.China(),
+            "CNH": lambda: ql.China(),
+            "KRW": lambda: ql.SouthKorea(ql.SouthKorea.KRX),
+            "TWD": lambda: ql.Taiwan(),
+            "INR": lambda: ql.India(),
+            "THB": lambda: ql.Thailand(),
+            "IDR": lambda: ql.Indonesia(),
+            
+            # Americas
+            "MXN": lambda: ql.Mexico(),
+            "BRL": lambda: ql.Brazil(),
+            "ARS": lambda: ql.Argentina(),
+            
+            # EMEA
+            "ZAR": lambda: ql.SouthAfrica(),
+            "TRY": lambda: ql.Turkey(),
+            "ILS": lambda: ql.Israel(),
+            "RUB": lambda: ql.Russia(),
+            "SAR": lambda: ql.SaudiArabia(),
+        }
+        
+        for ccy, cal_func in calendar_definitions.items():
+            try:
+                cls.CALENDARS[ccy] = cal_func()
+            except Exception as e:
+                logger.warning(f"Calendar for {ccy} not available in QuantLib: {e}. Using TARGET.")
+                cls.CALENDARS[ccy] = ql.TARGET()
 
     # Currency pairs with T+1 spot settlement
     T_PLUS_ONE_PAIRS = {
@@ -41,10 +91,22 @@ class FXCalendarFactory:
 
     @classmethod
     def get_currency_calendar(cls, currency: str) -> ql.Calendar:
-        """Get the calendar for a single currency."""
+        """
+        Get the calendar for a single currency.
+        
+        If currency is not in the predefined list, uses TARGET as fallback.
+        This allows trading any currency pair without explicitly adding calendars.
+        """
+        import logging
+        logger = logging.getLogger(__name__)
+        
+        # Initialize calendars on first access
+        cls._init_calendars()
+        
         currency = currency.upper()
         if currency not in cls.CALENDARS:
-            raise ValueError(f"Unsupported currency: {currency}. Supported: {list(cls.CALENDARS.keys())}")
+            logger.warning(f"Currency {currency} not in calendar list, using TARGET as fallback")
+            return ql.TARGET()
         return cls.CALENDARS[currency]
 
     @classmethod

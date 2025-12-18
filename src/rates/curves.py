@@ -100,9 +100,12 @@ class RateCurve:
 
         Returns:
             Interpolated interest rate
+            
+        Raises:
+            ValueError: If no rates in curve or spline build fails
         """
         if len(self.rates) == 0:
-            raise ValueError("No rates in curve")
+            raise ValueError("RATE CURVE ERROR: No rates in curve")
 
         if len(self.rates) == 1:
             return list(self.rates.values())[0]
@@ -111,8 +114,7 @@ class RateCurve:
             self._rebuild_spline()
 
         if self._spline is None:
-            # Fallback to simple interpolation
-            return self._rate_points[0] if self._rate_points else 0.0
+            raise ValueError("RATE CURVE ERROR: Failed to build spline interpolator")
 
         # Clamp to valid range for extrapolation
         t_min = self._time_points[0]

@@ -53,6 +53,7 @@ class FXOptionPricer(QMainWindow):
         self._shocked_market_data: Optional[ShockedMarketData] = None
         self._last_pricing_result = None
         self._last_pricing_params: Optional[OptionParams] = None
+        self._initializing: bool = True  # Flag to prevent reset during init
 
         # Initialize
         self._load_config()
@@ -60,9 +61,8 @@ class FXOptionPricer(QMainWindow):
         self._apply_style()
         self._connect_signals()
         self._set_defaults()
-
-        # Try to connect to Bloomberg
-        QTimer.singleShot(100, self._try_connect_bloomberg)
+        
+        self._initializing = False  # Init complete
 
         # Try to connect to Bloomberg
         QTimer.singleShot(100, self._try_connect_bloomberg)
@@ -81,7 +81,7 @@ class FXOptionPricer(QMainWindow):
     def _setup_ui(self) -> None:
         """Set up the user interface with two columns."""
         self.setWindowTitle("FX Option Pricer")
-        self.setMinimumSize(900, 700)
+        self.setMinimumSize(1200, 1200)
 
         # Central widget
         central = QWidget()
@@ -95,8 +95,8 @@ class FXOptionPricer(QMainWindow):
         # LEFT COLUMN - Pricer
         left_widget = QWidget()
         left_layout = QVBoxLayout(left_widget)
-        left_layout.setContentsMargins(0, 0, 0, 0)
-        left_layout.setSpacing(2)
+        left_layout.setContentsMargins(5, 5, 5, 5)
+        left_layout.setSpacing(8)
 
         self._create_header_section(left_layout)
         self._create_input_section(left_layout)
@@ -115,8 +115,8 @@ class FXOptionPricer(QMainWindow):
         # RIGHT COLUMN - Shock Analysis
         right_widget = QWidget()
         right_layout = QVBoxLayout(right_widget)
-        right_layout.setContentsMargins(0, 0, 0, 0)
-        right_layout.setSpacing(2)
+        right_layout.setContentsMargins(5, 5, 5, 5)
+        right_layout.setSpacing(8)
 
         self._create_shock_params_section(right_layout)
         self._create_shock_deltas_section(right_layout)
@@ -130,7 +130,7 @@ class FXOptionPricer(QMainWindow):
     def _create_header_section(self, parent_layout: QVBoxLayout) -> None:
         """Create the header section with description and date."""
         grid = QGridLayout()
-        grid.setSpacing(2)
+        grid.setSpacing(4)
 
         # TS Description
         grid.addWidget(QLabel("TS Description"), 0, 0)
@@ -163,7 +163,7 @@ class FXOptionPricer(QMainWindow):
     def _create_input_section(self, parent_layout: QVBoxLayout) -> None:
         """Create the main input section."""
         grid = QGridLayout()
-        grid.setSpacing(2)
+        grid.setSpacing(4)
 
         row = 0
 
@@ -225,9 +225,10 @@ class FXOptionPricer(QMainWindow):
         grid.addWidget(self.delivery_date_display, row, 2)
         row += 1
 
-        # Strike
+        # Strike - accepts numeric value or delta notation (e.g., "25d", "10p", "ATMF")
         grid.addWidget(QLabel("Strike"), row, 0)
-        self.strike_input = NumericInput(decimals=5)
+        self.strike_input = QLineEdit()
+        self.strike_input.setPlaceholderText("1.0850 or 25d or ATMF")
         grid.addWidget(self.strike_input, row, 1, 1, 2)
         self.strike_label = QLabel("ATMF")
         self.strike_label.setFixedWidth(50)
@@ -258,7 +259,7 @@ class FXOptionPricer(QMainWindow):
         parent_layout.addWidget(header)
 
         grid = QGridLayout()
-        grid.setSpacing(2)
+        grid.setSpacing(4)
 
         row = 0
 
@@ -321,7 +322,7 @@ class FXOptionPricer(QMainWindow):
         parent_layout.addWidget(header)
 
         grid = QGridLayout()
-        grid.setSpacing(2)
+        grid.setSpacing(4)
 
         # Gamma
         grid.addWidget(QLabel("Gamma"), 0, 0)
@@ -346,7 +347,7 @@ class FXOptionPricer(QMainWindow):
         parent_layout.addWidget(header)
 
         grid = QGridLayout()
-        grid.setSpacing(2)
+        grid.setSpacing(4)
 
         row = 0
 
@@ -417,7 +418,7 @@ class FXOptionPricer(QMainWindow):
         parent_layout.addWidget(header)
 
         grid = QGridLayout()
-        grid.setSpacing(2)
+        grid.setSpacing(4)
 
         # Start Date
         grid.addWidget(QLabel("Start Date"), 0, 0)
@@ -454,7 +455,7 @@ class FXOptionPricer(QMainWindow):
         parent_layout.addWidget(header)
 
         grid = QGridLayout()
-        grid.setSpacing(2)
+        grid.setSpacing(4)
 
         row = 0
 
@@ -501,7 +502,7 @@ class FXOptionPricer(QMainWindow):
         parent_layout.addWidget(header)
 
         grid = QGridLayout()
-        grid.setSpacing(2)
+        grid.setSpacing(4)
 
         row = 0
 
@@ -579,8 +580,72 @@ class FXOptionPricer(QMainWindow):
 
         parent_layout.addLayout(grid2)
 
+        # === TIME DECAY ONLY SECTION ===
+        self._create_time_decay_only_section(parent_layout)
+
         # Add stretch
         parent_layout.addStretch()
+
+    def _create_time_decay_only_section(self, parent_layout: QVBoxLayout) -> None:
+        """Create the time decay only section (no market shock)."""
+        header = SectionHeader("Time Decay Only (No Market Change)")
+        parent_layout.addWidget(header)
+
+        grid = QGridLayout()
+        grid.setSpacing(4)
+
+        row = 0
+
+        # Decay Only Expiry
+        grid.addWidget(QLabel("New Expiry"), row, 0)
+        self.decay_only_expiry_display = QLineEdit()
+        self.decay_only_expiry_display.setReadOnly(True)
+        grid.addWidget(self.decay_only_expiry_display, row, 1)
+        row += 1
+
+        # Decay Only Vol (at strike)
+        grid.addWidget(QLabel("Vol (at strike)"), row, 0)
+        self.decay_only_vol_display = QLineEdit()
+        self.decay_only_vol_display.setReadOnly(True)
+        grid.addWidget(self.decay_only_vol_display, row, 1)
+        row += 1
+
+        # Decay Only Premium
+        grid.addWidget(QLabel("New Premium"), row, 0)
+        self.decay_only_premium_display = QLineEdit()
+        self.decay_only_premium_display.setReadOnly(True)
+        grid.addWidget(self.decay_only_premium_display, row, 1)
+        row += 1
+
+        # Decay Only P&L
+        grid.addWidget(QLabel("P&L (Theta)"), row, 0)
+        self.decay_only_pnl_display = QLineEdit()
+        self.decay_only_pnl_display.setReadOnly(True)
+        grid.addWidget(self.decay_only_pnl_display, row, 1)
+        row += 1
+
+        # Decay Only Delta
+        grid.addWidget(QLabel("New Delta"), row, 0)
+        self.decay_only_delta_display = QLineEdit()
+        self.decay_only_delta_display.setReadOnly(True)
+        grid.addWidget(self.decay_only_delta_display, row, 1)
+        row += 1
+
+        # Decay Only Theta (daily)
+        grid.addWidget(QLabel("Daily Theta"), row, 0)
+        self.decay_only_theta_display = QLineEdit()
+        self.decay_only_theta_display.setReadOnly(True)
+        grid.addWidget(self.decay_only_theta_display, row, 1)
+        row += 1
+
+        # P&L Ratio: abs(shocked P&L) / abs(theta P&L)
+        grid.addWidget(QLabel("P&L Ratio"), row, 0)
+        self.pnl_ratio_display = QLineEdit()
+        self.pnl_ratio_display.setReadOnly(True)
+        self.pnl_ratio_display.setToolTip("Ratio of |Shocked P&L| / |Theta P&L| - shows market impact vs time decay")
+        grid.addWidget(self.pnl_ratio_display, row, 1)
+
+        parent_layout.addLayout(grid)
 
     def _apply_style(self) -> None:
         """Apply the dark theme stylesheet."""
@@ -591,13 +656,14 @@ class FXOptionPricer(QMainWindow):
         self.asset_combo.currentTextChanged.connect(self._on_asset_changed)
         self.expiry_input.textChanged.connect(self._on_expiry_changed)
         self.spot_input.valueChanged.connect(self._on_input_changed)
-        self.strike_input.valueChanged.connect(self._on_input_changed)
+        self.strike_input.textChanged.connect(self._on_input_changed)
         self.call_put_combo.currentTextChanged.connect(self._on_input_changed)
         self.notional_input.valueChanged.connect(self._on_input_changed)
-        # Recalculate when delta type or premium currency changes
+        # Recalculate when delta type, premium currency, or direction changes
         self.delta_type.currentTextChanged.connect(self._on_calculate)
         self.premium_ccy.currentTextChanged.connect(self._on_calculate)
         self.price_format.currentTextChanged.connect(self._on_calculate)
+        self.direction_combo.currentTextChanged.connect(self._on_calculate)
 
     def _set_defaults(self) -> None:
         """Set default values from config."""
@@ -762,6 +828,10 @@ class FXOptionPricer(QMainWindow):
         # Reset surfaces
         self._vol_surface = None
         self._fx_rates = None
+        
+        # Reset all results when asset changes
+        if not self._initializing:
+            self._reset_results()
 
         if self._bbg_connected:
             self._load_market_data()
@@ -790,6 +860,10 @@ class FXOptionPricer(QMainWindow):
                     delivery = FXCalendarFactory.get_delivery_from_expiry(ccy_pair, expiry)
                     self.expiry_date_display.setText(expiry.strftime("%m/%d/%y"))
                     self.delivery_date_display.setText(delivery.strftime("%m/%d/%y"))
+            
+            # Reset results when expiry changes
+            if not self._initializing:
+                self._reset_results()
 
         except Exception as e:
             logger.warning(f"Failed to parse expiry: {e}")
@@ -797,8 +871,146 @@ class FXOptionPricer(QMainWindow):
             self.delivery_date_display.setText("")
 
     def _on_input_changed(self) -> None:
-        """Handle input field changes."""
-        pass
+        """Handle input field changes - reset results."""
+        if self._initializing:
+            return
+        self._reset_results()
+
+    def _reset_results(self) -> None:
+        """Reset all results fields when input parameters change."""
+        try:
+            # Reset left column results
+            self.vol_display.setText("")
+            self.points_display.setText("")
+            self.forward_display.setText("")
+            self.foreign_depo_display.setText("")
+            self.domestic_depo_display.setText("")
+            self.gamma_display.setText("")
+            self.vega_display.setText("")
+            self.price_display.setText("")
+            self.premium_display.setText("")
+            self.prem_date_display.setText("")
+            self.delta_display.setText("")
+            self.hedge_display.setText("")
+            
+            # Reset right column (shocked results)
+            self.shocked_expiry_display.setText("")
+            self.shocked_spot_display.setText("")
+            self.shocked_vol_display.setText("")
+            self.shocked_forward_display.setText("")
+            self.shocked_premium_display.setText("")
+            self.shocked_pnl_display.setText("")
+            self.shocked_pnl_display.setStyleSheet("")  # Reset color
+            self.shocked_delta_display.setText("")
+            self.shocked_gamma_display.setText("")
+            self.shocked_vega_display.setText("")
+            
+            # Reset time decay only results
+            self.decay_only_expiry_display.setText("")
+            self.decay_only_vol_display.setText("")
+            self.decay_only_premium_display.setText("")
+            self.decay_only_pnl_display.setText("")
+            self.decay_only_pnl_display.setStyleSheet("")  # Reset color
+            self.decay_only_delta_display.setText("")
+            self.decay_only_theta_display.setText("")
+            self.pnl_ratio_display.setText("")
+            self.pnl_ratio_display.setStyleSheet("")  # Reset color
+            
+            # Reset shock deltas
+            self.shock_time_decay.setText("")
+            self.shock_spot_change.setText("")
+            self.shock_vol_change.setText("")
+            self.shock_rate_change.setText("")
+            self.shock_status.setText("Not loaded")
+            
+            # Disable apply shock button
+            self.apply_shock_btn.setEnabled(False)
+            
+            # Reset cached data
+            self._last_pricing_result = None
+            self._last_pricing_params = None
+            self._market_delta = None
+            self._shocked_market_data = None
+        except AttributeError:
+            # Some widgets may not exist yet during initialization
+            pass
+
+    def _parse_strike_input(
+        self, 
+        strike_text: str, 
+        spot: float, 
+        forward: float,
+        r_dom: float, 
+        r_for: float, 
+        vol: float, 
+        time_to_expiry: float,
+        is_call: bool
+    ) -> tuple:
+        """
+        Parse strike input which can be:
+        - A numeric value (e.g., "1.0850")
+        - Delta notation for calls (e.g., "25d", "25D", "10d")
+        - Delta notation for puts (e.g., "-25d", "25p", "25P", "10p")
+        - ATMF or ATM for at-the-money forward/spot
+        
+        Returns:
+            Tuple of (strike_value, strike_label)
+        """
+        import re
+        
+        strike_text = strike_text.strip().upper()
+        
+        # Empty or ATMF/ATM → use forward
+        if not strike_text or strike_text in ("ATMF", "ATM", "0"):
+            return forward, "ATMF"
+        
+        # Delta notation patterns
+        # Positive delta call: "25D", "25d", "10D"
+        # Negative delta put: "-25D", "25P", "10P"
+        delta_call_pattern = re.compile(r'^(\d+(?:\.\d+)?)\s*D$', re.IGNORECASE)
+        delta_put_pattern = re.compile(r'^-?(\d+(?:\.\d+)?)\s*P$', re.IGNORECASE)
+        delta_negative_pattern = re.compile(r'^-(\d+(?:\.\d+)?)\s*D$', re.IGNORECASE)
+        
+        # Check for call delta (e.g., "25D")
+        match = delta_call_pattern.match(strike_text)
+        if match:
+            delta_value = float(match.group(1)) / 100.0  # Convert 25 to 0.25
+            calculated_strike = GarmanKohlhagen.calculate_strike_from_delta(
+                spot, delta_value, r_dom, r_for, vol, time_to_expiry, is_call=True
+            )
+            return calculated_strike, f"{int(delta_value*100)}D Call"
+        
+        # Check for put delta (e.g., "25P" or "-25D")
+        match = delta_put_pattern.match(strike_text)
+        if match:
+            delta_value = float(match.group(1)) / 100.0
+            # Put delta is negative in the formula
+            calculated_strike = GarmanKohlhagen.calculate_strike_from_delta(
+                spot, -delta_value, r_dom, r_for, vol, time_to_expiry, is_call=False
+            )
+            return calculated_strike, f"{int(delta_value*100)}D Put"
+        
+        # Check for negative delta notation (e.g., "-25D")
+        match = delta_negative_pattern.match(strike_text)
+        if match:
+            delta_value = float(match.group(1)) / 100.0
+            calculated_strike = GarmanKohlhagen.calculate_strike_from_delta(
+                spot, -delta_value, r_dom, r_for, vol, time_to_expiry, is_call=False
+            )
+            return calculated_strike, f"{int(delta_value*100)}D Put"
+        
+        # Try to parse as numeric value
+        try:
+            # Remove thousands separators
+            numeric_text = strike_text.replace(",", "").replace(" ", "")
+            strike_value = float(numeric_text)
+            if strike_value <= 0:
+                return forward, "ATMF"
+            return strike_value, ""
+        except ValueError:
+            # Invalid input, default to ATMF
+            logger.warning(f"Invalid strike input: {strike_text}, using ATMF")
+            return forward, "ATMF"
 
     def _on_calculate(self) -> None:
         """Perform the option pricing calculation."""
@@ -821,7 +1033,7 @@ class FXOptionPricer(QMainWindow):
 
         ccy_pair = self.asset_combo.currentText().replace("/", "")
         spot = self.spot_input.get_value()
-        strike = self.strike_input.get_value()
+        strike_text = self.strike_input.text()
         notional = self.notional_input.get_value()
         is_call = self.call_put_combo.currentText() == "Call"
 
@@ -848,24 +1060,33 @@ class FXOptionPricer(QMainWindow):
             forward = spot * (1 + (r_dom - r_for) * time_to_expiry)
 
         logger.info(f"=== CALCULATION ===")
-        logger.info(f"Spot: {spot}, Strike: {strike}, Time: {time_to_expiry:.4f}")
+        logger.info(f"Spot: {spot}, Strike input: '{strike_text}', Time: {time_to_expiry:.4f}")
         logger.info(f"r_dom: {r_dom:.6f}, r_for: {r_for:.6f}")
         logger.info(f"Forward: {forward:.5f}")
 
         # Get forward points for display
         fwd_points = (forward - spot) * 10000  # Convert to pips
 
-        # Get interpolated volatility
+        # Get preliminary ATM vol for delta-to-strike calculation
+        preliminary_vol = self._get_interpolated_vol(0, time_to_expiry, spot, r_dom, r_for)
+        
+        # Parse strike input (numeric, delta notation, or ATMF)
+        strike, strike_label = self._parse_strike_input(
+            strike_text, spot, forward, r_dom, r_for, preliminary_vol, time_to_expiry, is_call
+        )
+        self.strike_label.setText(strike_label)
+        logger.info(f"Parsed strike: {strike:.5f} ({strike_label if strike_label else 'numeric'})")
+        
+        # Update strike input field with calculated numeric value
+        # This replaces "25d", "ATMF", etc. with the actual strike
+        # Block signals to prevent triggering _on_input_changed
+        self.strike_input.blockSignals(True)
+        self.strike_input.setText(f"{strike:.5f}")
+        self.strike_input.blockSignals(False)
+
+        # Get interpolated volatility for actual strike
         vol = self._get_interpolated_vol(strike, time_to_expiry, spot, r_dom, r_for)
         logger.info(f"Vol: {vol:.4f}")
-
-        # If strike is 0 or not set, use ATMF
-        if strike <= 0:
-            strike = forward
-            self.strike_input.set_value(strike)
-            self.strike_label.setText("ATMF")
-        else:
-            self.strike_label.setText("")
 
         # Build option parameters
         notional_ccy = self.notional_ccy.currentText()
@@ -894,12 +1115,7 @@ class FXOptionPricer(QMainWindow):
         logger.info(f"Delta: {result.greeks.delta:.4f}")
         logger.info(f"Gamma: {result.greeks.gamma:.8f}")
 
-        direction_text = self.direction_combo.currentText()
-        direction = Direction.CLIENT_BUYS if "buys" in direction_text.lower() else Direction.CLIENT_SELLS
-
-        hedge = GarmanKohlhagen.calculate_delta_hedge(params, direction)
-
-        self._update_results_display(result, r_dom, r_for, forward, vol, fwd_points, hedge, params)
+        self._update_results_display(result, r_dom, r_for, forward, vol, fwd_points, params)
 
     def _get_interpolated_vol(
         self,
@@ -909,16 +1125,22 @@ class FXOptionPricer(QMainWindow):
         r_dom: float,
         r_for: float
     ) -> float:
-        """Get interpolated volatility for strike and expiry."""
-        # Default volatility if no surface available
-        DEFAULT_VOL = 0.10  # 10%
-
+        """
+        Get interpolated volatility for strike and expiry.
+        
+        Raises:
+            ValueError: If no vol surface available or interpolation fails
+        """
         if not self._vol_surface:
-            return DEFAULT_VOL
+            error_msg = "VOL INTERPOLATION ERROR: No volatility surface available"
+            logger.error(error_msg)
+            raise ValueError(error_msg)
 
         # Check if surface has valid smiles
         if len(self._vol_surface.tenors) == 0:
-            return DEFAULT_VOL
+            error_msg = "VOL INTERPOLATION ERROR: Volatility surface has no tenors"
+            logger.error(error_msg)
+            raise ValueError(error_msg)
 
         try:
             if strike <= 0:
@@ -926,16 +1148,24 @@ class FXOptionPricer(QMainWindow):
             else:
                 vol = self._vol_surface.get_vol(strike, time_to_expiry, spot, r_dom, r_for)
 
-            # Sanity check: vol should be between 0.01 (1%) and 2.0 (200%)
-            if vol < 0.01 or vol > 2.0:
-                logger.warning(f"Volatility {vol} out of range, using default")
-                return DEFAULT_VOL
+            # Sanity check: vol should be between 0.001 (0.1%) and 2.0 (200%)
+            if vol <= 0:
+                error_msg = f"VOL INTERPOLATION ERROR: Volatility <= 0 ({vol:.6f})"
+                logger.error(error_msg)
+                raise ValueError(error_msg)
+            if vol > 2.0:
+                error_msg = f"VOL INTERPOLATION ERROR: Volatility > 200% ({vol:.4f})"
+                logger.error(error_msg)
+                raise ValueError(error_msg)
 
             return vol
 
+        except ValueError:
+            raise  # Re-raise our own errors
         except Exception as e:
-            logger.warning(f"Error interpolating volatility: {e}, using default")
-            return DEFAULT_VOL
+            error_msg = f"VOL INTERPOLATION ERROR: {e}"
+            logger.error(error_msg)
+            raise ValueError(error_msg)
 
     def _update_results_display(
         self,
@@ -945,7 +1175,6 @@ class FXOptionPricer(QMainWindow):
         forward: float,
         vol: float,
         fwd_points: float,
-        hedge: float,
         params: OptionParams
     ) -> None:
         """Update the results display fields."""
@@ -1017,13 +1246,23 @@ class FXOptionPricer(QMainWindow):
         delta_type = self.delta_type.currentText()
         if delta_type == "Fwd":
             # Forward delta = spot delta * exp(r_for * t)
-            import math
             fwd_delta = result.greeks.delta * math.exp(r_for * params.time_to_expiry)
             self.delta_display.setText(f"{fwd_delta * 100:.4f}%")
+            # Hedge based on forward delta
+            delta_for_hedge = fwd_delta
         else:
             self.delta_display.setText(f"{result.greeks.delta * 100:.4f}%")
+            delta_for_hedge = result.greeks.delta
         
-        self.hedge_display.setText(f"{hedge:,.2f}")
+        # Recalculate hedge based on selected delta type
+        direction_text = self.direction_combo.currentText()
+        hedge_sign = 1.0 if "buys" in direction_text.lower() else -1.0
+        if params.notional_currency == "FOR":
+            hedge_notional = delta_for_hedge * params.notional * hedge_sign
+        else:
+            hedge_notional = delta_for_hedge * params.notional / params.spot * hedge_sign
+        
+        self.hedge_display.setText(f"{hedge_notional:,.2f}")
 
     def _on_refresh_data(self) -> None:
         """Refresh market data from Bloomberg."""
@@ -1128,7 +1367,7 @@ class FXOptionPricer(QMainWindow):
             self.statusBar().showMessage("Load failed")
 
     def _update_shock_deltas_display(self) -> None:
-        """Update the shock deltas display fields."""
+        """Update the shock deltas display fields after loading historical data."""
         if not self._market_delta:
             return
 
@@ -1141,19 +1380,60 @@ class FXOptionPricer(QMainWindow):
         spot_pct = self._market_delta.spot_pct_change * 100
         self.shock_spot_change.setText(f"{spot_pct:+.2f}%")
 
-        # Vol change (average)
-        if self._market_delta.atm_vol_diffs:
-            avg_vol_diff = sum(self._market_delta.atm_vol_diffs.values()) / len(self._market_delta.atm_vol_diffs)
-            self.shock_vol_change.setText(f"{avg_vol_diff * 100:+.2f}%")
-        else:
-            self.shock_vol_change.setText("N/A")
+        # Vol and Rate: show "Click Apply" until we know the option tenor
+        self.shock_vol_change.setText("Click Apply")
+        self.shock_rate_change.setText("Click Apply")
 
-        # Rate change (average)
-        if self._market_delta.usd_rate_diffs:
-            avg_rate_diff = sum(self._market_delta.usd_rate_diffs.values()) / len(self._market_delta.usd_rate_diffs)
-            self.shock_rate_change.setText(f"{avg_rate_diff * 100:+.2f}%")
+    def _update_shock_deltas_with_interpolated(
+        self,
+        vol_diff: float,
+        rate_diff: float,
+        time_to_expiry: float
+    ) -> None:
+        """Update shock deltas with interpolated values at option tenor."""
+        # Convert time to approximate tenor for display
+        if time_to_expiry <= 0.04:  # ~2W
+            tenor_label = "2W"
+        elif time_to_expiry <= 0.08:  # ~1M
+            tenor_label = "1M"
+        elif time_to_expiry <= 0.25:  # ~3M
+            tenor_label = "3M"
+        elif time_to_expiry <= 0.5:  # ~6M
+            tenor_label = "6M"
+        elif time_to_expiry <= 1.0:  # ~1Y
+            tenor_label = "1Y"
         else:
-            self.shock_rate_change.setText("N/A")
+            tenor_label = f"{time_to_expiry:.1f}Y"
+
+        self.shock_vol_change.setText(f"{vol_diff * 100:+.2f}% ({tenor_label})")
+        self.shock_rate_change.setText(f"{rate_diff * 100:+.2f}% ({tenor_label})")
+
+    def _interpolate_atm_vol_diff(self, time_to_expiry: float) -> float:
+        """
+        Interpolate ATM vol diff from MarketDataDelta to the given tenor.
+        
+        Args:
+            time_to_expiry: Time in years
+            
+        Returns:
+            Interpolated ATM vol diff (as decimal)
+        """
+        if not self._market_delta or not self._market_delta.atm_vol_diffs:
+            return 0.0
+        
+        from ..models.interpolation import linear_interpolate
+        
+        # Build time/diff points from atm_vol_diffs
+        tenors = list(self._market_delta.atm_vol_diffs.keys())
+        diffs = list(self._market_delta.atm_vol_diffs.values())
+        times = [tenor_to_years(t) for t in tenors]
+        
+        # Sort by time
+        sorted_data = sorted(zip(times, diffs))
+        times = [d[0] for d in sorted_data]
+        diffs = [d[1] for d in sorted_data]
+        
+        return linear_interpolate(time_to_expiry, times, diffs)
 
     def _on_apply_shock(self) -> None:
         """Apply the calculated shock to current market data and reprice."""
@@ -1221,16 +1501,33 @@ class FXOptionPricer(QMainWindow):
                 self._shocked_market_data.foreign_rates
             )
             
-            # Interpolate shocked vol
+            # Interpolate shocked vol at the SPECIFIC STRIKE using full surface
+            strike = self._last_pricing_params.strike
             shocked_vol = self._get_interpolated_shocked_vol(
+                strike,
                 shocked_time_to_expiry,
-                self._shocked_market_data.atm_vols
+                shocked_spot,
+                shocked_dom_rate,
+                shocked_for_rate,
+                self._shocked_market_data.vol_smiles
             )
 
             logger.info(f"Shocked spot: {shocked_spot:.5f}")
             logger.info(f"Shocked domestic rate: {shocked_dom_rate:.4f}")
             logger.info(f"Shocked foreign rate: {shocked_for_rate:.4f}")
-            logger.info(f"Shocked volatility: {shocked_vol:.4f}")
+            logger.info(f"Shocked volatility at strike {strike:.5f}: {shocked_vol:.4f}")
+
+            # Calculate interpolated deltas for display using historical market changes
+            # Use ATM vol diffs from MarketDataDelta, interpolated to option tenor
+            vol_diff = self._interpolate_atm_vol_diff(shocked_time_to_expiry)
+            logger.info(f"Vol diff (historical ATM interpolated): {vol_diff:.4f}")
+
+            original_dom_rate = self._last_pricing_params.domestic_rate
+            rate_diff = shocked_dom_rate - original_dom_rate
+            logger.info(f"Rate diff (interpolated): {rate_diff:.4f}")
+
+            # Update deltas display with interpolated values
+            self._update_shock_deltas_with_interpolated(vol_diff, rate_diff, shocked_time_to_expiry)
 
             # Calculate shocked forward
             shocked_forward = shocked_spot * math.exp((shocked_dom_rate - shocked_for_rate) * shocked_time_to_expiry)
@@ -1269,6 +1566,85 @@ class FXOptionPricer(QMainWindow):
                 shocked_vol,
                 pnl
             )
+
+            # === TIME DECAY ONLY CALCULATION ===
+            # Revalue option assuming NO market change, only time passes
+            logger.info("=== CALCULATING TIME DECAY ONLY ===")
+            
+            decay_only_time_to_expiry = shocked_time_to_expiry  # Same reduced expiry
+            decay_only_expiry_days = shocked_expiry_days
+            
+            logger.info(f"Time decay only expiry: {decay_only_expiry_days} days ({decay_only_time_to_expiry:.4f} years)")
+            
+            # Use CURRENT market data (not shocked), but interpolate to new expiry
+            # Get rates at reduced expiry from current curves
+            current_spot = self._last_pricing_params.spot
+            if self._fx_rates:
+                decay_dom_rate = self._fx_rates.get_domestic_rate(decay_only_time_to_expiry)
+                decay_for_rate = self._fx_rates.get_foreign_rate(decay_only_time_to_expiry)
+            else:
+                decay_dom_rate = self._last_pricing_params.domestic_rate
+                decay_for_rate = self._last_pricing_params.foreign_rate
+            
+            # Get vol at reduced expiry AND at the SPECIFIC STRIKE from current surface
+            decay_strike = self._last_pricing_params.strike
+            if self._vol_surface:
+                try:
+                    # Use get_vol with strike to get smile-adjusted volatility
+                    decay_vol = self._vol_surface.get_vol(
+                        decay_strike, 
+                        decay_only_time_to_expiry, 
+                        current_spot, 
+                        decay_dom_rate, 
+                        decay_for_rate
+                    )
+                except Exception as e:
+                    logger.warning(f"Could not get vol at strike, falling back to ATM: {e}")
+                    decay_vol = self._vol_surface.get_atm_vol(decay_only_time_to_expiry)
+            else:
+                decay_vol = self._last_pricing_params.volatility
+            
+            # Calculate forward at reduced expiry (current spot, current rates, new time)
+            decay_forward = current_spot * math.exp((decay_dom_rate - decay_for_rate) * decay_only_time_to_expiry)
+            
+            logger.info(f"Decay only - Spot: {current_spot:.5f} (unchanged)")
+            logger.info(f"Decay only - Strike: {decay_strike:.5f}")
+            logger.info(f"Decay only - Dom rate at {decay_only_expiry_days}d: {decay_dom_rate:.4f}")
+            logger.info(f"Decay only - For rate at {decay_only_expiry_days}d: {decay_for_rate:.4f}")
+            logger.info(f"Decay only - Vol at strike {decay_strike:.5f}, {decay_only_expiry_days}d: {decay_vol:.4f}")
+            logger.info(f"Decay only - Forward: {decay_forward:.5f}")
+            
+            # Build time decay only option params
+            decay_params = OptionParams(
+                spot=current_spot,  # Unchanged
+                strike=self._last_pricing_params.strike,
+                domestic_rate=decay_dom_rate,
+                foreign_rate=decay_for_rate,
+                volatility=decay_vol,
+                time_to_expiry=decay_only_time_to_expiry,
+                is_call=self._last_pricing_params.is_call,
+                notional=self._last_pricing_params.notional,
+                notional_currency=self._last_pricing_params.notional_currency
+            )
+            
+            # Calculate time decay only option
+            decay_result = GarmanKohlhagen.calculate_all(decay_params)
+            
+            # Calculate P&L from time decay only
+            decay_pnl = decay_result.premium - original_premium
+            logger.info(f"Decay only premium: {decay_result.premium:.2f}")
+            logger.info(f"Decay only P&L (theta effect): {decay_pnl:+.2f}")
+            
+            # Update time decay only display (pass shocked pnl for ratio calculation)
+            self._update_time_decay_only_display(
+                decay_result,
+                decay_params,
+                decay_pnl,
+                decay_only_expiry_days,
+                pnl  # shocked pnl
+            )
+            
+            logger.info("=== TIME DECAY ONLY COMPLETE ===")
 
             self.shock_status.setText("Applied")
             self.statusBar().showMessage("Shock applied successfully!")
@@ -1311,28 +1687,169 @@ class FXOptionPricer(QMainWindow):
 
     def _get_interpolated_shocked_vol(
         self,
+        strike: float,
         time_to_expiry: float,
-        vols: Dict[str, float]
+        spot: float,
+        r_dom: float,
+        r_for: float,
+        vol_smiles: Dict[str, Dict[str, float]]
     ) -> float:
-        """Interpolate volatility from shocked vols dictionary."""
-        if not vols:
-            return 0.08  # Default
-
-        from ..models.interpolation import variance_interpolate
-
-        times = []
-        values = []
-        for tenor, vol in vols.items():
+        """
+        Interpolate volatility from shocked vol surface at specific strike.
+        
+        Uses a simpler approach: interpolate each smile at the strike first,
+        then interpolate across time using variance interpolation.
+        
+        Args:
+            strike: Option strike
+            time_to_expiry: Time to expiry in years
+            spot: Shocked spot rate
+            r_dom: Shocked domestic rate
+            r_for: Shocked foreign rate
+            vol_smiles: Dict of tenor -> {atm, rr25, rr10, bf25, bf10}
+            
+        Returns:
+            Interpolated volatility at the strike
+            
+        Raises:
+            ValueError: If vol_smiles is empty or interpolation fails
+        """
+        from ..models.interpolation import linear_interpolate, variance_interpolate
+        
+        if not vol_smiles:
+            error_msg = "SHOCKED VOL ERROR: No vol smiles provided"
+            logger.error(error_msg)
+            raise ValueError(error_msg)
+        
+        # For each tenor, calculate the vol at the target strike
+        tenor_times = []
+        vols_at_strike = []
+        errors = []
+        
+        for tenor, smile_data in vol_smiles.items():
             t = tenor_to_years(tenor)
-            times.append(t)
-            values.append(vol)
-
+            
+            atm = smile_data.get('atm')
+            rr25 = smile_data.get('rr25')
+            rr10 = smile_data.get('rr10')
+            bf25 = smile_data.get('bf25')
+            bf10 = smile_data.get('bf10')
+            
+            # Check for missing data
+            if atm is None:
+                errors.append(f"Tenor {tenor}: missing ATM vol")
+                continue
+            if rr25 is None:
+                errors.append(f"Tenor {tenor}: missing RR25")
+                continue
+            if bf25 is None:
+                errors.append(f"Tenor {tenor}: missing BF25")
+                continue
+            
+            # Use RR10/BF10 if available, otherwise approximate from RR25/BF25
+            if rr10 is None:
+                rr10 = rr25 * 1.8  # Approximate
+                logger.debug(f"Tenor {tenor}: RR10 approximated from RR25")
+            if bf10 is None:
+                bf10 = bf25 * 2.0  # Approximate
+                logger.debug(f"Tenor {tenor}: BF10 approximated from BF25")
+            
+            # Calculate individual vol points from ATM + RR + BF
+            vol_25c = atm + 0.5 * rr25 + bf25
+            vol_25p = atm - 0.5 * rr25 + bf25
+            vol_10c = atm + 0.5 * rr10 + bf10
+            vol_10p = atm - 0.5 * rr10 + bf10
+            
+            # Calculate strikes for this smile
+            from ..models.garman_kohlhagen import GarmanKohlhagen
+            
+            try:
+                strike_25c = GarmanKohlhagen.calculate_strike_from_delta(
+                    spot, 0.25, r_dom, r_for, vol_25c, t, is_call=True
+                )
+                strike_25p = GarmanKohlhagen.calculate_strike_from_delta(
+                    spot, -0.25, r_dom, r_for, vol_25p, t, is_call=False
+                )
+                strike_10c = GarmanKohlhagen.calculate_strike_from_delta(
+                    spot, 0.10, r_dom, r_for, vol_10c, t, is_call=True
+                )
+                strike_10p = GarmanKohlhagen.calculate_strike_from_delta(
+                    spot, -0.10, r_dom, r_for, vol_10p, t, is_call=False
+                )
+                # ATM strike
+                forward = spot * math.exp((r_dom - r_for) * t)
+                strike_atm = forward * math.exp(0.5 * atm ** 2 * t)
+                
+                # Build strike/vol pairs and sort
+                strikes = [strike_10p, strike_25p, strike_atm, strike_25c, strike_10c]
+                vols = [vol_10p, vol_25p, atm, vol_25c, vol_10c]
+                
+                logger.debug(f"Tenor {tenor}: strikes={[f'{s:.4f}' for s in strikes]}, vols={[f'{v:.4f}' for v in vols]}")
+                
+                # Sort by strike
+                sorted_pairs = sorted(zip(strikes, vols), key=lambda x: x[0])
+                sorted_strikes = [p[0] for p in sorted_pairs]
+                sorted_vols = [p[1] for p in sorted_pairs]
+                
+                # Interpolate (with extrapolation for strikes outside range)
+                vol_at_strike = linear_interpolate(strike, sorted_strikes, sorted_vols, extrapolate=True)
+                
+                # Validate result
+                if vol_at_strike <= 0:
+                    errors.append(f"Tenor {tenor}: interpolated vol <= 0 ({vol_at_strike:.4f})")
+                    continue
+                if vol_at_strike > 2.0:
+                    errors.append(f"Tenor {tenor}: interpolated vol > 200% ({vol_at_strike:.4f})")
+                    continue
+                    
+                tenor_times.append(t)
+                vols_at_strike.append(vol_at_strike)
+                logger.debug(f"Tenor {tenor}: vol at strike {strike:.4f} = {vol_at_strike:.4f}")
+                    
+            except Exception as e:
+                errors.append(f"Tenor {tenor}: strike calculation failed - {e}")
+        
+        # Report any errors
+        if errors:
+            for err in errors:
+                logger.warning(f"SHOCKED VOL WARNING: {err}")
+        
+        if not tenor_times:
+            error_msg = f"SHOCKED VOL ERROR: No valid tenors. Errors: {errors}"
+            logger.error(error_msg)
+            raise ValueError(error_msg)
+        
         # Sort by time
-        sorted_data = sorted(zip(times, values))
-        times = [d[0] for d in sorted_data]
-        values = [d[1] for d in sorted_data]
-
-        return variance_interpolate(time_to_expiry, times, values, extrapolate=True)
+        sorted_data = sorted(zip(tenor_times, vols_at_strike))
+        tenor_times = [d[0] for d in sorted_data]
+        vols_at_strike = [d[1] for d in sorted_data]
+        
+        logger.info(f"Shocked vol interpolation: {len(tenor_times)} tenors, strike={strike:.4f}, time={time_to_expiry:.4f}")
+        logger.info(f"  Tenor times: {[f'{t:.4f}' for t in tenor_times]}")
+        logger.info(f"  Vols at strike: {[f'{v:.4f}' for v in vols_at_strike]}")
+        
+        # Interpolate across time using variance interpolation
+        try:
+            result_vol = variance_interpolate(time_to_expiry, tenor_times, vols_at_strike, extrapolate=True)
+            
+            if result_vol <= 0:
+                error_msg = f"SHOCKED VOL ERROR: variance interpolation returned vol <= 0 ({result_vol:.4f})"
+                logger.error(error_msg)
+                raise ValueError(error_msg)
+            if result_vol > 2.0:
+                error_msg = f"SHOCKED VOL ERROR: variance interpolation returned vol > 200% ({result_vol:.4f})"
+                logger.error(error_msg)
+                raise ValueError(error_msg)
+                
+            logger.info(f"  Result vol: {result_vol:.4f} ({result_vol*100:.2f}%)")
+            return result_vol
+            
+        except ValueError:
+            raise  # Re-raise our own errors
+        except Exception as e:
+            error_msg = f"SHOCKED VOL ERROR: variance interpolation failed - {e}"
+            logger.error(error_msg)
+            raise ValueError(error_msg)
 
     def _update_shocked_results_display(
         self,
@@ -1407,6 +1924,90 @@ class FXOptionPricer(QMainWindow):
         else:
             vega_value = vega_dom
         self.shocked_vega_display.setText(f"{vega_value:,.0f} {premium_ccy}")
+
+    def _update_time_decay_only_display(
+        self,
+        decay_result,
+        decay_params: OptionParams,
+        pnl: float,
+        expiry_days: int,
+        shocked_pnl: float = 0.0
+    ) -> None:
+        """Update the time decay only display fields."""
+        logger.info("Updating time decay only display")
+
+        ccy_pair = self.asset_combo.currentText().replace("/", "")
+        base_ccy = ccy_pair[:3]
+        quote_ccy = ccy_pair[3:]
+        premium_ccy = self.premium_ccy.currentText()
+
+        # New expiry
+        self.decay_only_expiry_display.setText(f"{expiry_days} days")
+
+        # Vol at strike (from decay_params)
+        self.decay_only_vol_display.setText(f"{decay_params.volatility * 100:.3f}%")
+
+        # New premium
+        if premium_ccy == base_ccy:
+            premium_value = decay_result.premium / decay_params.spot
+        else:
+            premium_value = decay_result.premium
+        self.decay_only_premium_display.setText(f"{premium_value:,.2f} {premium_ccy}")
+
+        # P&L (theta effect)
+        if premium_ccy == base_ccy:
+            pnl_value = pnl / decay_params.spot
+            shocked_pnl_value = shocked_pnl / decay_params.spot
+        else:
+            pnl_value = pnl
+            shocked_pnl_value = shocked_pnl
+        
+        # Color P&L: green for profit, red for loss
+        if pnl_value >= 0:
+            self.decay_only_pnl_display.setStyleSheet("color: #00FF00;")
+        else:
+            self.decay_only_pnl_display.setStyleSheet("color: #FF4444;")
+        self.decay_only_pnl_display.setText(f"{pnl_value:+,.2f} {premium_ccy}")
+
+        # New delta
+        r_for = decay_params.foreign_rate
+        t = decay_params.time_to_expiry
+        delta_type = self.delta_type.currentText()
+        if delta_type == "Fwd":
+            new_delta = decay_result.greeks.delta * math.exp(r_for * t)
+        else:
+            new_delta = decay_result.greeks.delta
+        self.decay_only_delta_display.setText(f"{new_delta * 100:.4f}%")
+
+        # Daily theta (average per day based on time period)
+        time_diff_days = self._market_delta.time_diff_days if self._market_delta else expiry_days
+        if time_diff_days > 0:
+            daily_theta = pnl_value / time_diff_days
+        else:
+            daily_theta = decay_result.greeks.theta
+            if premium_ccy == base_ccy:
+                daily_theta = daily_theta / decay_params.spot
+        
+        self.decay_only_theta_display.setText(f"{daily_theta:+,.2f} {premium_ccy}/day")
+
+        # P&L Ratio: abs(shocked P&L) / abs(theta P&L)
+        # This shows how much of the total P&L is due to market moves vs time decay
+        if abs(pnl_value) > 0.01:  # Avoid division by very small numbers
+            ratio = abs(shocked_pnl_value) / abs(pnl_value)
+            
+            # Determine if market helped or hurt based on signs and magnitudes
+            market_contribution = shocked_pnl_value - pnl_value
+            
+            if market_contribution > abs(pnl_value) * 0.1:  # Market helped significantly
+                self.pnl_ratio_display.setStyleSheet("color: #00FF00;")  # Green
+            elif market_contribution < -abs(pnl_value) * 0.1:  # Market hurt significantly
+                self.pnl_ratio_display.setStyleSheet("color: #FF4444;")  # Red
+            else:  # Roughly neutral
+                self.pnl_ratio_display.setStyleSheet("color: #FFD700;")  # Yellow
+            self.pnl_ratio_display.setText(f"{ratio:.2f}x")
+        else:
+            self.pnl_ratio_display.setStyleSheet("")
+            self.pnl_ratio_display.setText("N/A")
 
     def closeEvent(self, event) -> None:
         """Handle window close."""
